@@ -866,28 +866,55 @@ const lanes = {
     const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 345600, 604800, 1209600, 2419200];
     const want = span / Math.max(1, (W - LEFT) / 120);
     const step = steps.find((s) => s >= want) || Math.ceil(want / 86400) * 86400;  // at least ~120 px between labels (hh:mm:ss with a date fits)
-    c.font = FONT; c.strokeStyle = "#eef0f3";
-    // ticks fall on whole seconds/minutes/hours/midnight of the selected time zone (offset taken per tick, so a DST change stays aligned).
+    // minor ticks: the largest smaller step that divides the major step into 2..7 parts
+    const minor = steps.filter((s) => s < step && step % s === 0 && step / s <= 7).pop() || 0;
+    // tick times on whole seconds/minutes/hours/midnight of the selected time zone (re-aligned per tick at hour steps, so DST stays on the hour)
+    const ticksOf = (st) => {
+      const out = [];
+      let prev = -Infinity, o0 = tzOffset(S.view.t0);
+      for (let tk = Math.ceil((S.view.t0 + o0) / st) * st - o0; tk <= S.view.t1 && out.length < 2000; tk += st) {
+        if (st >= 3600) { const o = tzOffset(tk), t = Math.round((tk + o) / st) * st - o; if (t > prev) tk = t; }
+        prev = tk;
+        if (xOf(cv, tk) >= LEFT) out.push(tk);
+      }
+      return out;
+    };
+    const majors = ticksOf(step), majorSet = new Set(majors), minors = minor ? ticksOf(minor).filter((t) => !majorSet.has(t)) : [];
+    // axis: baseline, minor ticks, major ticks with labels centred on them.
     // Label: always hh:mm:ss, with the date on the first tick and wherever the day changes (MM-DD only for steps of a day or more)
-    let prevDay = null, prevTk = -Infinity;
-    for (let tk = Math.ceil((S.view.t0 + tzOffset(S.view.t0)) / step) * step - tzOffset(S.view.t0); tk <= S.view.t1; tk += step) {
-      if (step >= 3600) { const o = tzOffset(tk), t = Math.round((tk + o) / step) * step - o; if (t > prevTk) tk = t; }
-      prevTk = tk;
+    c.font = FONT;
+    c.strokeStyle = "#9ca3af"; c.beginPath(); c.moveTo(LEFT, AXIS_H - 0.5); c.lineTo(W, AXIS_H - 0.5); c.stroke();
+    c.beginPath();
+    for (const tk of minors) { const x = Math.round(xOf(cv, tk)) + 0.5; c.moveTo(x, AXIS_H - 4); c.lineTo(x, AXIS_H); }
+    c.stroke();
+    c.strokeStyle = "#4b5563"; c.beginPath();
+    for (const tk of majors) { const x = Math.round(xOf(cv, tk)) + 0.5; c.moveTo(x, AXIS_H - 8); c.lineTo(x, AXIS_H); }
+    c.stroke();
+    let prevDay = null;
+    for (const tk of majors) {
       const x = xOf(cv, tk), p = tzParts(tk), day = `${pad(p.mo)}-${pad(p.d)}`;
-      if (x < LEFT) continue;
-      c.beginPath(); c.moveTo(x, AXIS_H - 4); c.lineTo(x, H); c.stroke();
       const hm = `${pad(p.h)}:${pad(p.mi)}:${pad(p.s)}`;
       const showDay = step >= 86400 || day !== prevDay;
-      c.fillStyle = showDay ? "#374151" : "#6b7280";
-      c.fillText(step >= 86400 ? day : showDay ? `${day} ${hm}` : hm, x + 2, 14);
+      const lbl = step >= 86400 ? day : showDay ? `${day} ${hm}` : hm, w = c.measureText(lbl).width;
+      c.fillStyle = showDay ? "#111827" : "#374151";
+      c.fillText(lbl, Math.min(Math.max(x - w / 2, LEFT + 2), W - w - 2), 12);
       prevDay = day;
     }
     c.fillStyle = "#9ca3af";  // which time zone the axis is in
-    c.fillText(fitText(c, tzShort(S.view.t0), LEFT - 6), 4, 14);
-    if (S.trace) {
-      c.fillStyle = "rgba(37,99,235,0.06)";
-      c.fillRect(xOf(cv, S.trace.t0), AXIS_H, xOf(cv, S.trace.t1) - xOf(cv, S.trace.t0), H - AXIS_H);
-    }
+    c.fillText(fitText(c, tzShort(S.view.t0), LEFT - 6), 4, 12);
+    // vertical grid lines and the trace range, drawn on each row after its background (else the background hides them)
+    const grid = (y0, y1) => {
+      if (S.trace) {
+        c.fillStyle = "rgba(37,99,235,0.07)";
+        c.fillRect(xOf(cv, S.trace.t0), y0, xOf(cv, S.trace.t1) - xOf(cv, S.trace.t0), y1 - y0);
+      }
+      c.strokeStyle = "#eceef2"; c.beginPath();
+      for (const tk of minors) { const x = Math.round(xOf(cv, tk)) + 0.5; c.moveTo(x, y0); c.lineTo(x, y1); }
+      c.stroke();
+      c.strokeStyle = "#d4d7dd"; c.beginPath();
+      for (const tk of majors) { const x = Math.round(xOf(cv, tk)) + 0.5; c.moveTo(x, y0); c.lineTo(x, y1); }
+      c.stroke();
+    };
     this.hits = [];
     const rows = this.rows(), ev = S.ev, row = {};  // row: laneKey -> that row
     let y = AXIS_H, band = 0;
@@ -895,6 +922,7 @@ const lanes = {
       r.y = y; y += r.h; row[laneKey(r.m, r.fn)] = r;
       if (r.fn == null) band++;
       c.fillStyle = r.fn != null ? "#f7f8fa" : band % 2 ? "#fff" : "#fafafb"; c.fillRect(LEFT, r.y, W - LEFT, r.h);
+      grid(r.y, r.y + r.h);
       if (r.fn == null) {  // module name, prefixed with ▶/▼ if it has functions; click it to expand or collapse
         c.fillStyle = S.colors[r.m]; c.font = "600 12px Segoe UI, sans-serif";
         c.fillText(fitText(c, (S.tree[r.m].length ? (r.open ? "▼ " : "▶ ") : "") + r.m, LEFT - 10), 6, r.y + r.h / 2 + 4);
@@ -981,8 +1009,8 @@ const lanes = {
       const t = tOf(cv, this.hoverX), lbl = fmtTs(Math.floor(t)), tw = c.measureText(lbl).width + 8;
       const lx = Math.min(Math.max(this.hoverX - tw / 2, LEFT), W - tw);
       c.strokeStyle = "rgba(17,24,39,0.35)"; c.beginPath(); c.moveTo(this.hoverX, AXIS_H); c.lineTo(this.hoverX, H); c.stroke();
-      c.fillStyle = "#111827"; c.fillRect(lx, 1, tw, AXIS_H - 4);
-      c.fillStyle = "#fff"; c.fillText(lbl, lx + 4, 14);
+      c.fillStyle = "#111827"; c.fillRect(lx, 0, tw, 16);
+      c.fillStyle = "#fff"; c.fillText(lbl, lx + 4, 12);
     }
     if (this.drag && this.drag.brush) {
       c.fillStyle = "rgba(37,99,235,0.15)";
