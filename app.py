@@ -30,7 +30,7 @@ import threading
 import traceback
 import urllib.parse
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import logindex
@@ -114,8 +114,9 @@ class App:
         if name == "health":
             return ix.health()
         if name == "ai":
-            anchor = one("anchor")
-            return build_ai_text(ix, f, int(anchor) if anchor else None), "text/plain; charset=utf-8"
+            anchor, tzoff = one("anchor"), one("tzoff")
+            tz = (timezone(timedelta(seconds=int(tzoff))), one("tzname") or "") if tzoff else None  # the time zone picked on the page
+            return build_ai_text(ix, f, int(anchor) if anchor else None, tz), "text/plain; charset=utf-8"
         if name == "regexcheck":
             return ix.regexcheck(examples=one("examples") == "1")
         if name == "regexpack":
@@ -156,10 +157,11 @@ def _n(x):
     return str(int(x)) if x == int(x) else f"{x:g}"
 
 
-def _fmt(ts, date=False):
+def _fmt(ts, date=False, tz=None):
+    """tz: a tzinfo, or None for this computer's local time."""
     if not ts:
         return "--"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S" if date else "%H:%M:%S")
+    return datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S" if date else "%H:%M:%S")
 
 
 def _fold(items):
@@ -205,9 +207,16 @@ def _fold(items):
     return folded
 
 
-def build_ai_text(ix, f, anchor_ts=None):
-    """/api/ai: log lines under the current filter -> drop noise, fold, fit the size limit, wrap in PROMPT."""
+def build_ai_text(ix, f, anchor_ts=None, tz=None):
+    """/api/ai: log lines under the current filter -> drop noise, fold, fit the size limit, wrap in PROMPT.
+    tz: (tzinfo, name) of the time zone picked on the page, or None for this computer's local time."""
     cfg = ix.cfg
+    tzi = tz[0] if tz else None
+    if tz:
+        off = int(tz[0].utcoffset(None).total_seconds()) // 60
+        tzlabel = f"{tz[1] + ', ' if tz[1] else ''}UTC{'-' if off < 0 else '+'}{abs(off) // 60:02d}:{abs(off) % 60:02d}"
+    else:
+        tzlabel = "local time"
     ids, tss = ix.rows(f)
     if not ids:
         return "(No log lines match the current filter)"
@@ -241,9 +250,9 @@ def build_ai_text(ix, f, anchor_ts=None):
     def mod_name(m):
         return cfg.module_names.get(re.sub(r"\d+$", "", m), "")
     head = ["[About this log excerpt]",
-            f"- Time range: {_fmt(tss[0], True)} - {_fmt(tss[-1])} (local time)",
-            f"- Key moment: {_fmt(anchor_ts, True)}",
-            "- Each line starts with the local time, followed by the raw log line; 10-digit numbers in the raw line are UNIX time (seconds).",
+            f"- Time range: {_fmt(tss[0], True, tzi)} - {_fmt(tss[-1], False, tzi)} ({tzlabel})",
+            f"- Key moment: {_fmt(anchor_ts, True, tzi)}",
+            f"- Each line starts with the time ({tzlabel}), followed by the raw log line; 10-digit numbers in the raw line are UNIX time (seconds).",
             "- Indented lines are continuation lines of the line above; uppercase words in parentheses are module names (e.g. (TANK1))."]
     mods = sorted({it["module"] for it in kept})
     if mods:
@@ -257,10 +266,10 @@ def build_ai_text(ix, f, anchor_ts=None):
         for code, it in alarms.items():
             name = ix.alarm_names.get(code, "")
             desc = ix.alarm_table.get(code, "") or ix.alarm_table.get(name.upper(), "")
-            head.append(f"  - {code}{(' = ' + name) if name else ''} ({it['module']}, first at {_fmt(it['ts'])})"
+            head.append(f"  - {code}{(' = ' + name) if name else ''} ({it['module']}, first at {_fmt(it['ts'], False, tzi)})"
                         f"{(': ' + desc) if desc else ''}")
     # 3. Fit the size limit
-    lines = [(it["note"] + "\n" if it["note"] else "") + f"{_fmt(it['ts'])} {it['text']}" for it in kept]
+    lines = [(it["note"] + "\n" if it["note"] else "") + f"{_fmt(it['ts'], False, tzi)} {it['text']}" for it in kept]
     budget = cfg.ai_max_chars - len(PROMPT) - sum(len(h) + 1 for h in head) - 200
     size = sum(len(x) + 1 for x in lines)
     dropped = 0
