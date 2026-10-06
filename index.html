@@ -1,0 +1,995 @@
+<!doctype html>
+<!--
+  Web page of the log analyzer (HTML + CSS + JS all in this one file, no external libraries).
+  All data comes from app.py's /api/...; see the top of app.py for the API list.
+
+  Pages:
+    Timeline     left: module -> function tree, filters, alarm list; top right: swimlanes (canvas);
+                 bottom right: log list (virtual scrolling) + details
+    Regex check  hit rate of each [parser] regex, captured values, lines not hit; pack it for the company AI to fix the regexes
+
+  Every area has scrollbars; the grey splitters can be dragged to resize; the right edge of each log list header can be dragged to resize the column.
+  Sizes are remembered in the browser (localStorage) and restored next time.
+
+  JS layout (sections marked =====): state S -> helpers -> draggable splitters and column widths -> open folder -> module tree/filters ->
+  alarms -> log list -> swimlanes -> regex check -> export -> startup
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log Analyzer</title>
+<style>
+:root {
+  --bg: #f7f7f8; --panel: #fff; --line: #e3e3e8; --text: #1f2328; --muted: #6b7280;
+  --accent: #2563eb; --alarm: #dc2626; --alarm-bg: #fee2e2; --clear-bg: #dcfce7; --sel: #dbeafe;
+  --mono: Consolas, "MS Gothic", "Noto Sans Mono CJK JP", monospace;
+  --cols: 128px 64px 150px 120px 150px 210px 1fr;   /* log list column widths, changed by dragging the header */
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font: 13px/1.4 "Segoe UI", "Yu Gothic UI", "Microsoft YaHei", sans-serif; color: var(--text);
+       background: var(--bg); display: flex; flex-direction: column; overflow: hidden; }
+header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#folder { flex: 1; min-width: 200px; font-family: var(--mono); }
+#status { color: var(--muted); max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+nav { display: flex; gap: 4px; }
+input, button { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.ai { background: #f5f3ff; border-color: #c4b5fd; }
+.tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.hidden { display: none !important; }
+.muted { color: var(--muted); font-weight: normal; }
+.hint { color: var(--muted); font-size: 12px; }
+.num { width: 56px; padding: 1px 4px; }
+.page { flex: 1; min-height: 0; display: flex; }
+
+/* splitters: drag to resize */
+.vsplit { width: 5px; flex: none; cursor: col-resize; background: var(--line); }
+.hsplit { height: 5px; flex: none; cursor: row-resize; background: var(--line); }
+.vsplit:hover, .hsplit:hover, .dragging { background: var(--accent); }
+
+aside { width: 300px; min-width: 160px; flex: none; background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
+aside section { padding: 8px 10px; display: flex; flex-direction: column; gap: 5px; overflow: auto; flex: none; }
+aside section.grow { flex: 1; overflow: hidden; }
+aside h3 { margin: 0; font-size: 12px; }
+aside h3 a { font-weight: normal; font-size: 11px; margin-left: 6px; }
+#treeSec { height: 260px; overflow: hidden; }
+#treeSec, aside section.grow { min-height: 60px; }
+#tree, #alarms { flex: 1; min-height: 0; overflow: auto; }
+#tree { font-size: 12px; }
+.trange { display: flex; gap: 4px; align-items: center; }
+.trange > span { width: 34px; flex: none; }
+.trange input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.hint.bad { color: var(--alarm); }
+#tree .mod, #tree .fn { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+#tree .fn { padding-left: 30px; }
+#tree .tog { width: 16px; text-align: center; cursor: pointer; color: var(--muted); user-select: none; flex: none; }
+#tree .cnt { color: var(--muted); margin-left: auto; padding-left: 8px; }
+#tree .fn .name { overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); }
+.sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex: none; }
+.chip { background: var(--sel); border-radius: 4px; padding: 3px 6px; font-size: 12px; }
+#alarms { font-size: 12px; }
+.alarm-item { padding: 3px 4px; border-bottom: 1px dashed var(--line); cursor: pointer; }
+.alarm-item:hover { background: var(--alarm-bg); }
+.alarm-item .code, .alarm-group .code { color: var(--alarm); font-weight: 600; font-family: var(--mono); }
+.alarm-item .st { font-size: 11px; white-space: nowrap; }
+.alarm-item .st.reset { color: #15803d; text-decoration: underline dotted; }
+.alarm-item .st.open { color: var(--alarm); font-weight: 600; }
+.alarm-item .st.req { color: #b45309; text-decoration: underline dotted; }
+.alarm-item .st[data-reset] { cursor: pointer; }
+.alarm-item .desc { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.alarm-item .hex, .alarm-group .hex { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.lv { display: inline-block; padding: 0 4px; border-radius: 3px; color: #fff; font-size: 11px; line-height: 15px; }
+.alarm-tools { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.alarm-tools select { font: inherit; font-size: 12px; padding: 2px; }
+.alarm-group { padding: 3px 4px; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: 4px; align-items: baseline; flex-wrap: wrap; background: #fafafb; }
+.alarm-group:hover { background: var(--alarm-bg); }
+.alarm-group .tog { width: 12px; color: var(--muted); flex: none; }
+.alarm-group .n { font-weight: 600; }
+.alarm-group .open { color: var(--alarm); font-size: 11px; }
+.alarm-item.sub { padding-left: 18px; }
+
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#chart { position: relative; background: var(--panel); height: 230px; min-height: 40px; flex: none; overflow: auto; }
+canvas { display: block; width: 100%; cursor: crosshair; }
+.corner { position: sticky; left: 0; bottom: 0; text-align: right; padding-right: 8px; font-size: 11px; color: var(--muted); pointer-events: none; }
+.tip { position: absolute; pointer-events: none; background: #111827; color: #fff; padding: 4px 8px;
+       border-radius: 4px; font-size: 12px; max-width: 420px; white-space: pre-wrap; z-index: 5; }
+
+#listBox { flex: 1; min-height: 60px; display: flex; flex-direction: column; overflow-x: auto; background: var(--panel); }
+.row-grid { display: grid; grid-template-columns: var(--cols); gap: 0; padding: 0 8px; }
+.row-grid > span { padding-right: 8px; overflow: hidden; text-overflow: ellipsis; }
+.row-grid.head { background: #eef0f3; font-weight: 600; font-size: 12px; line-height: 22px; border-bottom: 1px solid var(--line); position: sticky; top: 0; }
+.row-grid.head > span { position: relative; }
+.colgrip { position: absolute; right: 2px; top: 0; bottom: 0; width: 6px; cursor: col-resize; border-right: 1px solid #c9ccd3; }
+.colgrip:hover { border-right: 3px solid var(--accent); }
+#listHead, #list { min-width: var(--listw, 900px); }
+#list { flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; font-family: var(--mono); font-size: 12px; }
+#listRows { position: absolute; left: 0; right: 0; top: 0; }
+.r { height: 20px; line-height: 20px; white-space: nowrap; cursor: pointer; }
+.r:hover { background: #f3f4f6; }
+.r.alarm { background: var(--alarm-bg); }
+.r.clear { background: var(--clear-bg); }
+.r.abn { color: var(--alarm); }
+.r.sel { background: var(--sel) !important; }
+.r .inh { color: var(--muted); font-style: italic; }
+.r .modc { font-weight: 600; }
+.r .more { color: var(--accent); margin-left: 6px; }
+#detail { flex: none; height: 150px; min-height: 30px; overflow: auto; padding: 8px 12px;
+          background: #fbfbfc; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+#detail .meta { font-family: inherit; color: var(--muted); margin-bottom: 4px; white-space: normal; }
+#detail .where { font-family: inherit; margin-bottom: 4px; white-space: normal; }
+#detail .where code { font-family: var(--mono); font-weight: 600; background: var(--sel); padding: 1px 4px; border-radius: 3px; }
+#detail .where button { font-size: 11px; padding: 0 6px; margin-left: 4px; }
+
+#health { overflow: auto; padding: 12px 16px; display: block; }
+#health table { border-collapse: collapse; margin: 6px 0 18px; background: var(--panel); }
+#health th, #health td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; }
+#health td.n { text-align: right; font-variant-numeric: tabular-nums; }
+#health td.bad { color: var(--alarm); font-weight: 600; }
+#health code { font-family: var(--mono); }
+#health td.rx { max-width: 420px; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+#health td.vals { max-width: 520px; font-size: 12px; color: var(--muted); }
+#health td.ex { max-width: 640px; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+#health .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+#health h2 { font-size: 15px; margin: 18px 0 4px; }
+
+#aiDlg { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: flex; align-items: center; justify-content: center; z-index: 20; }
+#aiDlg .dlg { background: var(--panel); width: min(900px, 92vw); height: min(80vh, 760px); border-radius: 8px;
+              display: flex; flex-direction: column; padding: 12px; gap: 8px; resize: both; overflow: auto; }
+#aiText { flex: 1; font-family: var(--mono); font-size: 12px; resize: none; border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+.dlg-foot { display: flex; gap: 8px; align-items: center; }
+.dlg-foot .hint { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Log Analyzer</strong>
+  <input id="folder" placeholder="Log folder path, e.g. D:\logs\20261004 (Enter to open)" spellcheck="false">
+  <button id="btnOpen">Open</button>
+  <button id="btnReparse" title="Click here after changing logview.ini">Re-parse</button>
+  <span id="status"></span>
+  <nav>
+    <button class="tab active" data-tab="main">Timeline</button>
+    <button class="tab" data-tab="health" title="How many lines each regex hit, and what the lines it missed look like">Regex check</button>
+    <a href="#" id="resetLayout" class="hint" style="align-self:center;margin-left:6px" title="Reset splitters and column widths to defaults">Reset layout</a>
+  </nav>
+</header>
+
+<div id="main" class="page">
+  <aside id="aside">
+    <section id="treeSec">
+      <h3>Modules / Functions <a href="#" id="modAll">All</a> <a href="#" id="modNone">None</a>
+        <a href="#" id="expandAll">Expand</a> <a href="#" id="collapseAll">Collapse</a></h3>
+      <input id="funcFilter" placeholder="Filter function names">
+      <div id="tree"></div>
+    </section>
+    <div class="hsplit" data-target="treeSec" data-dim="height"></div>
+    <section id="filterSec">
+      <h3>Filter</h3>
+      <input id="q" placeholder="Keyword">
+      <label><input type="checkbox" id="regex"> Regex</label>
+      <input id="src" placeholder="Source file, e.g. tankctrl.cpp">
+      <div class="trange" title="To the second, both ends inclusive. Time only (hh:mm:ss) uses the first day of the logs; a 10-digit UNIX time also works">
+        <span>From</span><input id="tFrom" placeholder="2026-10-04 08:30:00" spellcheck="false"></div>
+      <div class="trange" title="To the second, both ends inclusive. Time only uses the same day as From">
+        <span>To</span><input id="tTo" placeholder="08:45:10" spellcheck="false"><button id="tGo">Find by time</button></div>
+      <div class="hint bad hidden" id="tErr"></div>
+      <label><input type="checkbox" id="eventsOnly"> Only events</label>
+      <label><input type="checkbox" id="alarmsOnly"> Only alarms</label>
+      <label title="Lines hit by [parser] abnormal, e.g. CMD_xxx_CPL(NG), NORMAL->ABNORMAL"><input type="checkbox" id="abnOnly"> Only abnormal</label>
+      <div id="rangeBox" class="hidden"><div class="chip"><span id="rangeText"></span> <a href="#" id="rangeClear">Clear</a></div></div>
+      <div><button id="btnExport">Export as text</button> <button id="btnAi" class="ai" title="Denoised and folded, wrapped in a prompt, to copy to the company AI">Export for AI</button></div>
+      <div class="hint" id="count"></div>
+    </section>
+    <div class="hsplit" data-target="filterSec" data-dim="height"></div>
+    <section class="grow">
+      <h3>Alarms <span class="muted" title="Clicking an alarm traces it: shows this many seconds before and after it">(click to trace
+        -<input id="tb" type="number" class="num"> s / +<input id="ta" type="number" class="num"> s)</span></h3>
+      <input id="alarmFilter" placeholder="Filter by code, module, function">
+      <div class="alarm-tools">
+        <label class="hint" title="Not cleared, RESET sent but not done, or raised again after clearing"><input type="checkbox" id="alarmOpenOnly"> Only not cleared</label>
+        <label class="hint" title="One line per alarm code with how many times it was raised; click it to list each occurrence"><input type="checkbox" id="alarmGroup"> Group by code</label>
+        <select id="alarmLevel" title="Level captured by [parser] alarm_level"><option value="">All levels</option></select>
+      </div>
+      <div id="alarms"></div>
+    </section>
+  </aside>
+  <div class="vsplit" data-target="aside" data-dim="width"></div>
+  <section class="content">
+    <div id="chart">
+      <canvas id="lanes"></canvas>
+      <div id="tip" class="tip hidden"></div>
+    </div>
+    <div class="corner">Wheel: zoom · Drag: pan · Shift+drag: select time range · Double-click: reset · Click event: jump to log</div>
+    <div class="hsplit" data-target="chart" data-dim="height"></div>
+    <div id="listBox">
+      <div id="listHead" class="row-grid head"></div>
+      <div id="list"><div id="listSpacer"></div><div id="listRows"></div></div>
+    </div>
+    <div class="hsplit" data-target="detail" data-dim="height" data-sign="-1"></div>
+    <div id="detail"><span class="hint">Click a log line to see its full text (with continuation lines), file and line number, and alarm description here.</span></div>
+  </section>
+</div>
+
+<div id="health" class="page hidden"></div>
+
+<div id="aiDlg" class="hidden">
+  <div class="dlg">
+    <div><b id="aiTitle">Export for AI: fault analysis</b> <span id="aiCount" class="hint"></span></div>
+    <textarea id="aiText" readonly spellcheck="false"></textarea>
+    <div class="dlg-foot">
+      <span class="hint" id="aiHint">Copy and paste into the company AI; if too long, download as .txt and upload it.</span>
+      <button id="aiCopy" class="ai">Copy</button>
+      <button id="aiSave">Download .txt</button>
+      <button id="aiClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ===== State =====
+const $ = (id) => document.getElementById(id);
+const PALETTE = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#db2777", "#0891b2",
+                 "#65a30d", "#ea580c", "#4f46e5", "#0d9488", "#9333ea", "#b45309"];
+const ROW_H = 20, PAGE = 200, MAX_SCROLL_PX = 8_000_000;   // log list
+const LANE_H = 34, SUB_H = 24, AXIS_H = 24;                // swimlanes: module row height, function row height, axis height
+let LEFT = 70;                                             // width of the name column left of the swimlanes (wider when functions are expanded)
+const FONT = "11px Segoe UI, Yu Gothic UI, Microsoft YaHei, sans-serif";
+const NO_FUNC = "(no function)";
+const ALARM_SHOW = 1000;                                   // max alarms drawn in the alarm list at once
+// log list columns: name, default width (the last one takes the rest)
+// "Source" is the .cpp the line names; "Log file:line" is where the line is in the log folder (to find it on site)
+const COLS = [["Time", 128], ["Module", 64], ["Function", 150], ["Source", 120], ["Event", 150], ["Log file:line", 210], ["Text", 0]];
+const S = {
+  summary: null, modules: [], colors: {},
+  tree: {},             // module -> [[function, line count], ...] (function "" means no function name)
+  sel: {},              // module -> Set(selected functions)
+  open: new Set(),      // expanded modules
+  f: {}, count: 0, pages: new Map(), selId: null,      // list: filter, hit count, fetched pages, selected row
+  view: { t0: 0, t1: 1 }, trace: null, cursorTs: null,  // swimlanes: visible time range, trace range, current time of the list
+  ev: null, alarms: [],
+};
+
+// ===== Helpers =====
+const pad = (n) => String(n).padStart(2, "0");
+function fmtTs(ts, withDate = true) {
+  if (!ts) return "--";
+  const d = new Date(ts * 1000);
+  const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return withDate ? `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hms}` : hms;
+}
+const fmtFull = (ts) => `${new Date(ts * 1000).getFullYear()}-${fmtTs(ts)}`;
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// alarm name (learned from the logs by [parser] alarm_name, e.g. 12345678 -> TMP1) and the description from alarm_table.csv (looked up by code or name)
+const alarmName = (code) => (S.summary && code && S.summary.alarm_names[code]) || "";
+const alarmDesc = (code) => (S.summary && code && (S.summary.alarm_table[code] ||
+  S.summary.alarm_table[alarmName(code).toUpperCase()])) || "";
+const withName = (code) => code && alarmName(code) ? `${code} ${alarmName(code)}` : (code || "");
+// level colors: we don't know which level is more severe, so one color per level, no shading
+const LV_COLORS = ["#7c3aed", "#0891b2", "#b45309", "#be185d", "#4d7c0f", "#475569"];
+const lvColor = (lv) => LV_COLORS[(S.levels || []).indexOf(lv) % LV_COLORS.length] || "#475569";
+function fmtDur(s) {
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ${s % 60} s`;
+  return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+}
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; }
+function debounce(fn, ms) { let tm; return (...a) => { clearTimeout(tm); tm = setTimeout(() => fn(...a), ms); }; }
+function store(k, v) {  // read: store(k); write: store(k, v). Fine if the browser doesn't allow storage
+  try { if (v === undefined) return JSON.parse(localStorage.getItem("logview." + k)); localStorage.setItem("logview." + k, JSON.stringify(v)); }
+  catch { return null; }
+}
+function apiUrl(path, params) {
+  const u = new URL("/api/" + path, location.href);
+  for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, typeof v === "object" ? JSON.stringify(v) : v);
+  return u;
+}
+async function api(path, params) {
+  const r = await fetch(apiUrl(path, params));
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+// ===== Draggable splitters and column widths =====
+// Splitter <div class="hsplit|vsplit" data-target="element id" data-dim="height|width" data-sign="-1">:
+// dragging changes the target's height or width (sign=-1: the target is after the splitter, dragging up enlarges it)
+const sizes = store("sizes") || {};
+for (const [id, px] of Object.entries(sizes)) { const el = $(id); if (el) el.style[id === "aside" ? "width" : "height"] = px + "px"; }
+document.querySelectorAll(".hsplit, .vsplit").forEach((bar) => {
+  bar.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    const el = $(bar.dataset.target), dim = bar.dataset.dim, sign = +(bar.dataset.sign || 1);
+    const start = dim === "width" ? e.clientX : e.clientY, size0 = el.getBoundingClientRect()[dim];
+    bar.classList.add("dragging");
+    const move = (ev) => {
+      const px = Math.max(30, size0 + sign * ((dim === "width" ? ev.clientX : ev.clientY) - start));
+      el.style[dim] = px + "px"; sizes[bar.dataset.target] = Math.round(px);
+      if (bar.dataset.target === "chart" || bar.dataset.target === "aside") lanes.resize();
+      renderRows();
+    };
+    const up = () => { bar.classList.remove("dragging"); window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); store("sizes", sizes); };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  });
+});
+// column widths: the line at the right edge of each header cell can be dragged
+let colW = store("cols");
+if (!Array.isArray(colW) || colW.length !== COLS.length) colW = COLS.map((c) => c[1]);  // saved by a version with other columns
+function applyCols() {  // when the columns are wider than the window, the log area gets a horizontal scrollbar
+  const root = document.documentElement.style;
+  root.setProperty("--cols", colW.map((w, i) => (i === COLS.length - 1 ? "minmax(300px, 1fr)" : w + "px")).join(" "));
+  root.setProperty("--listw", colW.slice(0, -1).reduce((a, b) => a + b, 0) + 316 + "px");
+}
+$("listHead").innerHTML = COLS.map(([name], i) => `<span>${name}${i < COLS.length - 1 ? `<span class="colgrip" data-i="${i}"></span>` : ""}</span>`).join("");
+$("listHead").addEventListener("mousedown", (e) => {
+  const g = e.target.closest(".colgrip"); if (!g) return;
+  e.preventDefault();
+  const i = +g.dataset.i, x0 = e.clientX, w0 = colW[i];
+  const move = (ev) => { colW[i] = Math.max(30, w0 + ev.clientX - x0); applyCols(); };
+  const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); store("cols", colW); };
+  window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+});
+applyCols();
+$("resetLayout").onclick = (e) => {
+  e.preventDefault();
+  store("sizes", {}); store("cols", null); location.reload();
+};
+
+// ===== Open folder =====
+async function openFolder(force) {
+  const folder = $("folder").value.trim();
+  if (!folder) { $("folder").focus(); return; }
+  store("folder", folder);
+  const r = await fetch("/api/open", { method: "POST", body: JSON.stringify({ folder, force }) });
+  const j = await r.json();
+  if (!r.ok) { setStatus(j.error, true); return; }
+  pollStatus();
+}
+function setStatus(msg, bad) { $("status").textContent = msg || ""; $("status").style.color = bad ? "var(--alarm)" : ""; }
+async function pollStatus() {
+  const s = await api("status");
+  if (s.state === "loading") { setStatus(s.msg); setTimeout(pollStatus, 400); return; }
+  if (s.state === "error") { setStatus("Error: " + s.msg, true); return; }
+  if (s.state !== "ready") return;
+  const sm = s.summary;
+  setStatus(`${sm.files} files · ${sm.total.toLocaleString()} records · ${s.msg}` +
+    (sm.warnings.length ? ` · ${sm.warnings.length} config warning(s), see Regex check` : ""), sm.warnings.length > 0);
+  if (!S.summary || S.summary.folder !== sm.folder || S.summary.total !== sm.total || s.rebuilt) onLoaded(sm);
+}
+function onLoaded(sm) {
+  S.summary = sm;
+  $("folder").value = sm.folder;
+  S.modules = sm.modules; S.tree = sm.tree;
+  S.colors = {};
+  sm.modules.forEach((m, i) => (S.colors[m] = PALETTE[i % PALETTE.length]));
+  selectAll(true);
+  S.view = { t0: sm.t_min, t1: Math.max(sm.t_max, sm.t_min + 60) };
+  S.trace = null; S.selId = null;
+  $("tb").value = sm.trace_before; $("ta").value = sm.trace_after;
+  renderTree(); loadAlarms(); loadHealth();
+  setFilterFromUI();
+}
+
+// ===== Module / function tree, filters =====
+function selectAll(on) { for (const m of S.modules) S.sel[m] = new Set(on ? S.tree[m].map((x) => x[0]) : []); }
+const modState = (m) => (S.sel[m].size === 0 ? "none" : S.sel[m].size === S.tree[m].length ? "all" : "some");
+function renderTree() {
+  const q = $("funcFilter").value.trim().toLowerCase();
+  let html = "";
+  for (const m of S.modules) {
+    const fns = S.tree[m].filter(([fn]) => !q || fn.toLowerCase().includes(q));
+    if (q && !fns.length) continue;
+    const total = S.tree[m].reduce((a, x) => a + x[1], 0);
+    const open = S.open.has(m) || !!q;
+    html += `<div class="mod"><span class="tog" data-tog="${esc(m)}">${open ? "▼" : "▶"}</span>
+      <input type="checkbox" data-m="${esc(m)}"><span class="sw" style="background:${S.colors[m]}"></span>
+      <b>${esc(m)}</b><span class="cnt">${total.toLocaleString()}</span></div>`;
+    if (open) for (const [fn, n] of fns) html += `<label class="fn" title="${esc(fn || NO_FUNC)}">
+      <input type="checkbox" data-m="${esc(m)}" data-fn="${esc(fn)}" ${S.sel[m].has(fn) ? "checked" : ""}>
+      <span class="name">${esc(fn || NO_FUNC)}</span><span class="cnt">${n.toLocaleString()}</span></label>`;
+  }
+  $("tree").innerHTML = html || `<div class="hint">No matching functions</div>`;
+  $("tree").querySelectorAll("input[data-m]:not([data-fn])").forEach((cb) => {  // module checkbox: all / some (dash) / none
+    const st = modState(cb.dataset.m);
+    cb.checked = st === "all"; cb.indeterminate = st === "some";
+  });
+}
+$("tree").addEventListener("click", (e) => {
+  const t = e.target.dataset.tog; if (t == null) return;
+  toggleOpen(t);
+});
+$("tree").addEventListener("change", (e) => {
+  const m = e.target.dataset.m; if (!m) return;
+  if (e.target.dataset.fn != null) e.target.checked ? S.sel[m].add(e.target.dataset.fn) : S.sel[m].delete(e.target.dataset.fn);
+  else S.sel[m] = new Set(e.target.checked ? S.tree[m].map((x) => x[0]) : []);
+  renderTree(); setFilterFromUI();
+});
+$("funcFilter").addEventListener("input", debounce(renderTree, 200));
+$("modAll").onclick = (e) => { e.preventDefault(); selectAll(true); renderTree(); setFilterFromUI(); };
+$("modNone").onclick = (e) => { e.preventDefault(); selectAll(false); renderTree(); setFilterFromUI(); };
+$("expandAll").onclick = (e) => { e.preventDefault(); S.open = new Set(S.modules); renderTree(); lanes.resize(); viewChanged(); };
+$("collapseAll").onclick = (e) => { e.preventDefault(); S.open = new Set(); renderTree(); lanes.resize(); viewChanged(); };
+
+// the filter S.f is the f sent to the server (see logindex.Index._where)
+function setFilterFromUI() {
+  const f = {};
+  if (S.modules.some((m) => modState(m) !== "all")) {  // something not fully selected: whole modules go in modules, partial ones in funcs
+    f.modules = S.modules.filter((m) => modState(m) === "all");
+    f.funcs = S.modules.filter((m) => modState(m) === "some").flatMap((m) => [...S.sel[m]].map((fn) => [m, fn]));
+  }
+  if ($("q").value) f.q = $("q").value;
+  if ($("regex").checked) f.regex = true;
+  if ($("src").value) f.src = $("src").value;
+  if ($("eventsOnly").checked) f.events_only = true;
+  if ($("alarmsOnly").checked) f.alarms_only = true;
+  if ($("abnOnly").checked) f.abn_only = true;
+  if (S.trace) { f.t0 = S.trace.t0; f.t1 = S.trace.t1; }
+  S.f = f;
+  for (const [id, ts] of [["tFrom", S.trace && S.trace.t0], ["tTo", S.trace && S.trace.t1]])  // time boxes follow the current range (except the one being typed in)
+    if (document.activeElement !== $(id)) $(id).value = ts != null ? fmtFull(ts) : "";
+  $("rangeBox").classList.toggle("hidden", !S.trace);
+  if (S.trace) $("rangeText").textContent = `${S.trace.label}: ${fmtTs(S.trace.t0)} ~ ${fmtTs(S.trace.t1, false)}`;
+  refreshList();
+  lanes.resize(); viewChanged();
+}
+for (const id of ["q", "src"]) $(id).addEventListener("input", debounce(setFilterFromUI, 350));
+for (const id of ["regex", "eventsOnly", "alarmsOnly", "abnOnly"]) $(id).addEventListener("change", setFilterFromUI);
+$("rangeClear").onclick = (e) => { e.preventDefault(); S.trace = null; $("tErr").classList.add("hidden"); setFilterFromUI(); };
+
+// exact time range: 2026-10-04 08:30:00, 2026/10/04 8:30:00, 10-04 08:30:00, 08:30:00 (date taken from base), 10- or 13-digit UNIX time
+function parseTime(text, base, isEnd) {
+  const t = text.trim();
+  if (!t) return null;
+  if (/^\d{10}$/.test(t)) return +t;
+  if (/^\d{13}$/.test(t)) return Math.floor(+t / 1000);
+  const m = t.match(/^(?:(?:(\d{4})[-\/.])?(\d{1,2})[-\/.](\d{1,2}))?[ T]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!m || (!m[3] && m[4] == null)) return NaN;
+  const b = new Date(base * 1000);
+  const y = m[1] ? +m[1] : b.getFullYear(), mo = m[2] ? +m[2] - 1 : b.getMonth(), d = m[3] ? +m[3] : b.getDate();
+  if (m[4] == null) return new Date(y, mo, d, isEnd ? 23 : 0, isEnd ? 59 : 0, isEnd ? 59 : 0).getTime() / 1000;  // date only: the whole day
+  return new Date(y, mo, d, +m[4], +m[5], m[6] != null ? +m[6] : isEnd ? 59 : 0).getTime() / 1000;
+}
+function applyTimeRange() {
+  if (!S.summary) return;
+  const err = (msg) => { $("tErr").textContent = msg; $("tErr").classList.toggle("hidden", !msg); };
+  const from = $("tFrom").value, to = $("tTo").value;
+  if (!from.trim() && !to.trim()) { err(""); S.trace = null; setFilterFromUI(); return; }
+  const a = parseTime(from, S.summary.t_min, false);
+  const b = parseTime(to, a != null && !isNaN(a) ? a : S.summary.t_min, true);
+  if (Number.isNaN(a) || Number.isNaN(b)) { err("Can't read the time. E.g. 2026-10-04 08:30:00 or 08:30:00"); return; }
+  const t0 = a ?? S.summary.t_min;  // only one end given: the other is the start or end of the logs
+  let t1 = b ?? S.summary.t_max;
+  // To is a time only (no date) and earlier than From: the range crosses midnight, e.g. 23:50 -> 00:10 the next day
+  if (a != null && b != null && t1 < t0 && !/[-\/.]/.test(to)) t1 += 86400;
+  if (t0 > t1) { err("Start time is after end time"); return; }
+  err("");
+  S.trace = { t0, t1, label: "Time range" };
+  const pad_ = Math.max(0, (10 - (t1 - t0)) / 2);  // if the range is very short, the swimlanes still show at least 10 s
+  S.view = { t0: t0 - pad_, t1: t1 + 1 + pad_ };
+  S.selId = null;
+  $("tFrom").blur(); $("tTo").blur();
+  setFilterFromUI();
+}
+$("tGo").onclick = applyTimeRange;
+for (const id of ["tFrom", "tTo"]) $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") applyTimeRange(); });
+
+// ===== Alarm list, trace =====
+async function loadAlarms() {
+  S.alarms = (await api("alarms")).alarms;
+  S.levels = [...new Set(S.alarms.map((a) => a.level).filter((x) => x != null))].sort();
+  const sel = $("alarmLevel"), cur = sel.value;
+  sel.innerHTML = `<option value="">All levels</option>` + S.levels.map((v) => `<option value="${esc(v)}">Level ${esc(v)}</option>`).join("");
+  sel.value = S.levels.includes(cur) ? cur : "";
+  sel.classList.toggle("hidden", !S.levels.length);
+  renderAlarms();
+}
+// Only alarms with a code have a cleared state. With [parser] alarm_done set, RESET is only an action; "reset done" counts as cleared.
+// Clicking the time in the state jumps to that line (data-reset is the line, data-ts the time)
+const alarmUnresolved = (a) => a.alarm && (a.reset_ts == null || a.reraise_ts != null);
+function alarmState(a) {
+  if (!a.alarm) return "";
+  const done = S.summary.use_done;
+  let s;
+  if (a.reset_ts == null) {
+    s = a.reset_req_ts != null
+      ? `<span class="st req" data-reset="${a.reset_req_id}" data-ts="${a.reset_req_ts}" title="RESET action seen, but no reset done ([parser] alarm_done) up to the end of the logs. Click to jump to the RESET line">RESET sent ${fmtTs(a.reset_req_ts, false)}, not done</span>`
+      : `<span class="st open" title="No ${done ? "reset done" : "RESET"} with the same code up to the end of the logs">Not cleared</span>`;
+  } else {
+    const dur = a.ts && a.reset_ts >= a.ts ? ` (${fmtDur(a.reset_ts - a.ts)})` : "";
+    s = `<span class="st reset" data-reset="${a.reset_id}" data-ts="${a.reset_ts}" title="Click to jump to the clearing line">${done ? "Reset done" : "Cleared"} ${fmtTs(a.reset_ts, false)}${esc(dur)}</span>`;
+  }
+  if (a.reraise_ts != null) s += ` <span class="st open" data-reset="${a.reraise_id}" data-ts="${a.reraise_ts}" title="The same alarm was raised again soon after clearing (within [parser] reset_check seconds); clearing may have failed. Click to jump there">Raised again ${a.reraise_ts - a.reset_ts} s later</span>`;
+  return s;
+}
+function alarmItem(a, sub) {  // one occurrence; with a name: the name large and the code small after it, without a name just the code
+  return `<div class="alarm-item${sub ? " sub" : ""}" data-id="${a.id}">
+      ${fmtTs(a.ts)} <b>${esc(a.module)}</b> <span class="code">${esc(a.name || a.alarm || a.event)}</span>${a.name ? ` <span class="hex">${esc(a.alarm)}</span>` : ""}
+      ${a.level != null ? `<span class="lv" style="background:${lvColor(a.level)}" title="Level ([parser] alarm_level)">Lv${esc(a.level)}</span>` : ""}
+      ${alarmState(a)}
+      <div class="desc">${esc(alarmDesc(a.alarm) || a.func || "")}</div>
+    </div>`;
+}
+// Group by code: one line per alarm code (all modules together; alarms without a code are grouped by their event text),
+// in order of first occurrence, with count, first/last time and how many are not cleared. Click a group line to list its occurrences.
+const alarmOpenGroups = new Set();
+function alarmGroups(list) {
+  const groups = new Map();
+  for (const a of list) {
+    const key = a.alarm || a.event || "?";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+  return groups;
+}
+function renderAlarms() {
+  const k = $("alarmFilter").value.trim().toUpperCase(), openOnly = $("alarmOpenOnly").checked, lv = $("alarmLevel").value;
+  const list = S.alarms.filter((a) => (!k || [a.alarm, a.name, a.module, a.func, a.event].some((x) => (x || "").toUpperCase().includes(k))) &&
+    (!openOnly || alarmUnresolved(a)) && (!lv || a.level === lv));
+  if (!list.length) { $("alarms").innerHTML = `<div class="hint">No alarms</div>`; return; }
+  // Only the first ALARM_SHOW occurrences are drawn (tens of thousands of chattering alarms would freeze the page); the filter narrows the rest
+  let html = "", shown = 0;
+  if ($("alarmGroup").checked) {
+    for (const [key, as] of alarmGroups(list)) {
+      const a = as[0], open = alarmOpenGroups.has(key), bad = as.filter(alarmUnresolved).length;
+      const mods = [...new Set(as.map((x) => x.module))];
+      html += `<div class="alarm-group" data-group="${esc(key)}" title="${esc(alarmDesc(a.alarm) || "")}">
+        <span class="tog">${open ? "▼" : "▶"}</span><span class="code">${esc(a.name || a.alarm || a.event)}</span>${a.name ? ` <span class="hex">${esc(a.alarm)}</span>` : ""}
+        <span class="n">×${as.length}</span>
+        <span class="hint">${esc(mods.length > 3 ? mods.slice(0, 3).join(", ") + " …" : mods.join(", "))} · ${fmtTs(a.ts)}${as.length > 1 ? " ~ " + fmtTs(as[as.length - 1].ts) : ""}</span>
+        ${bad ? `<span class="open">${bad} not cleared</span>` : ""}</div>`;
+      if (open && shown < ALARM_SHOW) { html += as.slice(0, ALARM_SHOW - shown).map((x) => alarmItem(x, true)).join(""); shown += as.length; }
+    }
+  } else {
+    html = list.slice(0, ALARM_SHOW).map((a) => alarmItem(a)).join("");
+    shown = list.length;
+  }
+  if (shown > ALARM_SHOW) html += `<div class="hint">Showing the first ${ALARM_SHOW} of ${shown.toLocaleString()}; type in the filter above to narrow down</div>`;
+  $("alarms").innerHTML = html;
+}
+$("alarmGroup").checked = store("alarmGroup") !== false;  // grouped by default; the choice is remembered
+$("alarmGroup").addEventListener("change", () => { store("alarmGroup", $("alarmGroup").checked); renderAlarms(); });
+$("alarmFilter").addEventListener("input", renderAlarms);
+$("alarmOpenOnly").addEventListener("change", renderAlarms);
+$("alarmLevel").addEventListener("change", renderAlarms);
+$("alarms").addEventListener("click", (e) => {
+  const g = e.target.closest(".alarm-group");
+  if (g) { const key = g.dataset.group; alarmOpenGroups.has(key) ? alarmOpenGroups.delete(key) : alarmOpenGroups.add(key); renderAlarms(); return; }
+  const it = e.target.closest(".alarm-item"); if (!it) return;
+  const a = S.alarms.find((x) => x.id === +it.dataset.id);
+  const num = (id, d) => ($(id).value.trim() === "" || isNaN(+$(id).value) ? d : Math.max(0, +$(id).value));  // 0 is allowed
+  const before = num("tb", S.summary.trace_before), after = num("ta", S.summary.trace_after);
+  S.trace = { t0: a.ts - before, t1: a.ts + after, label: "Trace " + (a.alarm || a.event), anchor: a.ts };
+  S.view = { t0: S.trace.t0, t1: S.trace.t1 };
+  const rs = e.target.dataset.reset;
+  if (rs) {  // clicked "cleared / RESET sent / raised again": extend the range to that moment and jump to that line
+    S.trace.t1 = Math.max(S.trace.t1, +e.target.dataset.ts + 30); S.view.t1 = S.trace.t1;
+  }
+  S.selId = rs ? +rs : a.id;
+  setFilterFromUI();
+});
+
+// ===== Log list (virtual scrolling: render only visible rows, fetch pages from the server) =====
+const list = $("list"), rowsEl = $("listRows"), spacer = $("listSpacer");
+let listGen = 0, renderGen = 0;
+async function refreshList() {
+  const gen = ++listGen;
+  S.pages = new Map();
+  const { count, error } = await api("count", { f: S.f });
+  if (gen !== listGen) return;
+  S.count = count;
+  $("count").textContent = error || `${count.toLocaleString()} hits`;
+  $("count").classList.toggle("bad", !!error);
+  spacer.style.height = Math.min(count * ROW_H, MAX_SCROLL_PX) + "px";
+  if (S.selId != null) await jumpToId(S.selId); else renderRows();
+}
+function topIndex() {  // with very many rows the scrollbar is scaled proportionally
+  if (S.count * ROW_H <= MAX_SCROLL_PX) return Math.floor(list.scrollTop / ROW_H);
+  const vis = Math.floor(list.clientHeight / ROW_H);
+  return Math.round((list.scrollTop / Math.max(1, MAX_SCROLL_PX - list.clientHeight)) * Math.max(0, S.count - vis));
+}
+function scrollToIndex(i) {
+  const vis = Math.floor(list.clientHeight / ROW_H);
+  const target = Math.max(0, Math.min(i, S.count - 1) - Math.floor(vis / 3));
+  if (S.count * ROW_H <= MAX_SCROLL_PX) list.scrollTop = target * ROW_H;
+  else list.scrollTop = (target / Math.max(1, S.count - vis)) * (MAX_SCROLL_PX - list.clientHeight);
+  renderRows();
+}
+function getPage(p) {
+  if (!S.pages.has(p)) S.pages.set(p, api("page", { f: S.f, offset: p * PAGE, limit: PAGE }).then((r) => r.rows));
+  return S.pages.get(p);
+}
+async function renderRows() {
+  if (!S.summary) return;
+  if (!S.count) { rowsEl.innerHTML = ""; rowsEl._rows = []; return; }
+  const gen = ++renderGen, lgen = listGen;
+  const i0 = topIndex(), n = Math.ceil(list.clientHeight / ROW_H) + 1;
+  const p0 = Math.floor(i0 / PAGE), p1 = Math.floor((i0 + n) / PAGE);
+  const pages = await Promise.all(p0 === p1 ? [getPage(p0)] : [getPage(p0), getPage(p1)]);
+  if (gen !== renderGen || lgen !== listGen) return;
+  const rows = pages.flat().slice(i0 - p0 * PAGE, i0 - p0 * PAGE + n);
+  rowsEl.style.transform = `translateY(${list.scrollTop - (list.scrollTop % ROW_H)}px)`;
+  let prevDate = null;
+  rowsEl.innerHTML = rows.map((r) => {
+    const cls = ["r", "row-grid", r.level === "alarm" || r.level === "clear" || r.level === "abn" ? r.level : "", r.id === S.selId ? "sel" : ""];
+    const lines = r.text.split("\n");
+    const more = lines.length > 1 ? `<span class="more">+${lines.length - 1} lines</span>` : "";
+    const date = fmtTs(r.ts).slice(0, 5);
+    const tcell = date === prevDate ? "&nbsp;".repeat(6) + fmtTs(r.ts, false) : fmtTs(r.ts);
+    prevDate = date;
+    const ev = r.alarm ? `${{ DONE: "Reset done ", RESET: S.summary.use_done ? "RESET " : "Cleared " }[r.alarm_state] || ""}${withName(r.alarm)}` : (r.event || "");
+    return `<div class="${cls.join(" ")}" data-id="${r.id}">
+      <span class="${r.ts_inh ? "inh" : ""}" title="${r.ts_inh ? "No time on this line; time inherited from previous line" : r.ts}">${tcell}</span>
+      <span class="modc" style="color:${S.colors[r.module] || "#555"}">${esc(r.module)}</span>
+      <span title="${esc(r.func)}">${esc(r.func)}</span>
+      <span title="${esc(r.src)}">${esc(r.src)}</span>
+      <span title="${esc(alarmDesc(r.alarm))}" style="${r.color ? "color:" + r.color : ""}">${esc(ev)}</span>
+      <span title="${esc(r.file)} line ${r.lineno}">${esc(r.file.split("/").pop())}:${r.lineno}</span>
+      <span>${esc(lines[0])}${more}</span></div>`;
+  }).join("");
+  rowsEl._rows = rows;
+  if (rows.length && S.cursorTs !== rows[0].ts) { S.cursorTs = rows[0].ts; lanes.draw(); }
+}
+list.addEventListener("scroll", () => requestAnimationFrame(renderRows));
+rowsEl.addEventListener("click", (e) => {
+  const el = e.target.closest(".r"); if (!el) return;
+  selectRow(rowsEl._rows.find((x) => x.id === +el.dataset.id));
+});
+function selectRow(r) {  // bottom panel shows full text (with continuation lines), file and line number, alarm description
+  S.selId = r.id;
+  const desc = r.alarm ? alarmDesc(r.alarm) : "";
+  // where the record is in the log folder: relative path + line number (continuation lines follow it), and the full path to copy
+  const folder = S.summary.folder, sep = folder.includes("\\") ? "\\" : "/";
+  const full = folder.replace(/[\\/]+$/, "") + sep + r.file.split("/").join(sep);
+  const cont = r.text.includes("\n") ? ` <span class="hint">(+${r.text.split("\n").length - 1} continuation lines after it)</span>` : "";
+  $("detail").innerHTML = `<div class="where">Log file <code>${esc(r.file)}</code> line <code>${r.lineno}</code>${cont}
+    <button data-copy="${esc(full)}" title="${esc(full)}">Copy path</button><button data-copy="${esc(r.file)}:${r.lineno}">Copy file:line</button></div><div class="meta">${fmtFull(r.ts)} (${r.ts}${r.ts_inh ? ", time inherited from previous line" : ""}) · <b>${esc(r.module)}</b>
+    ${r.func ? " · " + esc(r.func) : ""}${r.src ? " · " + esc(r.src) + (r.srcline ? "(" + r.srcline + ")" : "") : ""}
+    ${desc || alarmName(r.alarm) ? `<br><span style="color:var(--alarm)">${esc(withName(r.alarm))}${desc ? ": " + esc(desc) : ""}</span>` : ""}</div><div>${esc(r.text)}</div>`;
+  renderRows();
+}
+$("detail").addEventListener("click", async (e) => {  // "Copy path" / "Copy file:line"
+  const b = e.target.closest("button[data-copy]"); if (!b) return;
+  try { await navigator.clipboard.writeText(b.dataset.copy); }
+  catch { const t = document.createElement("textarea"); t.value = b.dataset.copy; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  const old = b.textContent; b.textContent = "Copied"; setTimeout(() => (b.textContent = old), 1200);
+});
+async function jumpToId(id) {
+  const { pos } = await api("locate", { f: S.f, id });
+  S.selId = id;
+  scrollToIndex(pos);
+  const r = (await getPage(Math.floor(pos / PAGE))).find((x) => x.id === id);
+  if (r) selectRow(r);
+}
+async function jumpToTs(ts) { scrollToIndex((await api("locate", { f: S.f, ts: Math.floor(ts) })).pos); }
+
+// ===== Swimlanes: one row per module. ▲ alarm, ○ cleared, vertical line event, colored block interval, thin red band at top alarm duration, grey bar at bottom log density =====
+// A module can be expanded (click ▶ in the tree on the left, or the module name left of the swimlanes): the module row keeps the summary of
+// the whole module, and below it each function gets a row with only that function's lines.
+// So a CMD_ is drawn both on the module row and on its function row; an interval that starts and ends in the same function is also drawn
+// on the function row, one spanning functions only on the module row.
+const xOf = (cv, ts) => LEFT + ((ts - S.view.t0) / (S.view.t1 - S.view.t0)) * (cv.clientWidth - LEFT - 8);
+const tOf = (cv, x) => S.view.t0 + ((x - LEFT) / (cv.clientWidth - LEFT - 8)) * (S.view.t1 - S.view.t0);
+const laneKey = (m, fn) => (fn == null ? m : m + "\x01" + fn);  // same keys as the server's density.counts
+let viewGen = 0;
+const viewChanged = debounce(async () => {  // time range or expanded modules changed: fetch events again
+  if (!S.summary) return;
+  const gen = ++viewGen, span = S.view.t1 - S.view.t0;
+  const ev = await api("events", { t0: Math.floor(S.view.t0 - span * 0.1), t1: Math.ceil(S.view.t1 + span * 0.1),
+    expand: S.modules.filter((m) => S.open.has(m)) });
+  if (gen !== viewGen) return;
+  S.ev = ev; lanes.draw();
+}, 120);
+function toggleOpen(m) {  // expand / collapse a module (tree on the left and swimlanes together)
+  S.open.has(m) ? S.open.delete(m) : S.open.add(m);
+  renderTree(); lanes.resize(); viewChanged();
+}
+function fitText(c, text, w) {  // truncate with … if it doesn't fit
+  if (c.measureText(text).width <= w) return text;
+  while (text.length > 1 && c.measureText(text + "…").width > w) text = text.slice(0, -1);
+  return text + "…";
+}
+const lanes = {
+  cv: $("lanes"), hits: [], drag: null,
+  rows() {  // rows to draw: {m, fn, h}. fn null is a module row; function rows only for functions checked in the tree
+    const out = [];
+    for (const m of S.modules) {
+      if (!S.sel[m] || !S.sel[m].size) continue;
+      out.push({ m, fn: null, h: LANE_H, open: S.open.has(m) });
+      if (S.open.has(m)) for (const [fn] of S.tree[m]) if (S.sel[m].has(fn)) out.push({ m, fn, h: SUB_H });
+    }
+    return out;
+  },
+  resize() {
+    const cv = this.cv, rows = this.rows();
+    LEFT = rows.some((r) => r.fn != null) ? 170 : 70;
+    const h = AXIS_H + Math.max(LANE_H, rows.reduce((a, r) => a + r.h, 0)) + 14;
+    const dpr = window.devicePixelRatio || 1, w = cv.parentElement.clientWidth;
+    cv.style.height = h + "px"; cv.width = w * dpr; cv.height = h * dpr;
+    cv.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.draw();
+  },
+  draw() {
+    const cv = this.cv, c = cv.getContext("2d"), W = cv.clientWidth, H = cv.clientHeight, span = S.view.t1 - S.view.t0;
+    c.clearRect(0, 0, W, H);
+    // time axis, background of the trace range
+    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+    const step = steps.find((s) => s >= span / Math.max(1, (W - LEFT) / 110)) || 604800;
+    c.font = FONT; c.fillStyle = "#6b7280"; c.strokeStyle = "#eef0f3";
+    for (let tk = Math.ceil(S.view.t0 / step) * step; tk <= S.view.t1; tk += step) {
+      const x = xOf(cv, tk);
+      c.beginPath(); c.moveTo(x, AXIS_H - 4); c.lineTo(x, H); c.stroke();
+      c.fillText(step >= 86400 ? fmtTs(tk).slice(0, 5) : fmtTs(tk, !(step < 3600 * 6 && span < 86400)), x + 2, 14);
+    }
+    if (S.trace) {
+      c.fillStyle = "rgba(37,99,235,0.06)";
+      c.fillRect(xOf(cv, S.trace.t0), AXIS_H, xOf(cv, S.trace.t1) - xOf(cv, S.trace.t0), H - AXIS_H);
+    }
+    this.hits = [];
+    const rows = this.rows(), ev = S.ev, row = {};  // row: laneKey -> that row
+    let y = AXIS_H, band = 0;
+    for (const r of rows) {
+      r.y = y; y += r.h; row[laneKey(r.m, r.fn)] = r;
+      if (r.fn == null) band++;
+      c.fillStyle = r.fn != null ? "#f7f8fa" : band % 2 ? "#fff" : "#fafafb"; c.fillRect(LEFT, r.y, W - LEFT, r.h);
+      if (r.fn == null) {  // module name, prefixed with ▶/▼ if it has functions; click it to expand or collapse
+        c.fillStyle = S.colors[r.m]; c.font = "600 12px Segoe UI, sans-serif";
+        c.fillText(fitText(c, (S.tree[r.m].length ? (r.open ? "▼ " : "▶ ") : "") + r.m, LEFT - 10), 6, r.y + r.h / 2 + 4);
+        this.hits.push({ x0: 0, x1: LEFT - 2, y0: r.y, y1: r.y + r.h, toggle: r.m });
+      } else {
+        c.fillStyle = "#4b5563"; c.font = FONT;
+        c.fillText(fitText(c, r.fn || NO_FUNC, LEFT - 26), 20, r.y + r.h / 2 + 4);
+        c.strokeStyle = "#eef0f3"; c.beginPath(); c.moveTo(LEFT, r.y + 0.5); c.lineTo(W, r.y + 0.5); c.stroke();
+      }
+      const d = ev && ev.density, cnt = d && d.counts[laneKey(r.m, r.fn)];
+      if (!cnt) continue;
+      const mx = Math.max(...cnt) || 1;
+      cnt.forEach((n, b) => {
+        if (!n) return;
+        const x0 = xOf(cv, d.t0 + b * d.width), x1 = xOf(cv, d.t0 + (b + 1) * d.width);
+        c.fillStyle = `rgba(100,116,139,${0.05 + 0.18 * (n / mx)})`;
+        c.fillRect(x0, r.y + r.h - 6, Math.max(1, x1 - x0), 5);
+      });
+    }
+    if (ev) {
+      c.font = FONT;
+      // which rows an interval is drawn on: the module row, plus the function row if it starts and ends in the same function
+      const rowsOfIv = (iv) => [row[iv.module], iv.func != null ? row[laneKey(iv.module, iv.func)] : null].filter(Boolean);
+      // intervals: overlapping ones in the same row are drawn in two layers (e.g. Step inside LotProcess)
+      const lvl = new Map(), ends = new Map();
+      for (const iv of ev.intervals.filter((v) => v.kind !== "alarm").sort((a, b) => a.t0 - b.t0 || b.t1 - a.t1)) {
+        for (const r of rowsOfIv(iv)) {
+          const e = ends.get(r) || []; ends.set(r, e);
+          let l = e.findIndex((te) => te <= iv.t0);
+          if (l < 0) l = Math.min(e.length, 1);
+          e[l] = Math.max(e[l] || 0, iv.t1);
+          lvl.set(iv.t0 + "|" + iv.name + "|" + laneKey(r.m, r.fn), l);
+        }
+      }
+      for (const iv of ev.intervals) {
+        for (const r of rowsOfIv(iv)) {
+          const sub = r.fn != null;
+          const x0 = Math.max(LEFT, xOf(cv, iv.t0)); let x1 = Math.min(W, xOf(cv, iv.t1));
+          if (x1 < LEFT || x0 > W) continue;
+          x1 = Math.max(x1, x0 + 2);
+          const isAlarm = iv.kind === "alarm", l = lvl.get(iv.t0 + "|" + iv.name + "|" + laneKey(r.m, r.fn)) || 0;
+          const yy = isAlarm ? r.y + 2 : r.y + (sub ? 4 + l * 8 : 7 + l * 10), hh = isAlarm ? (sub ? 3 : 4) : sub ? 7 : 9;
+          c.globalAlpha = iv.closed ? 1 : 0.45;
+          c.fillStyle = isAlarm ? "rgba(220,38,38,0.25)" : hexA(S.colors[iv.module], 0.22);
+          c.fillRect(x0, yy, x1 - x0, hh);
+          if (!isAlarm && !sub && x1 - x0 > 60) {
+            c.fillStyle = "#374151"; c.font = "10px Segoe UI, sans-serif";
+            c.save(); c.beginPath(); c.rect(x0, yy, x1 - x0 - 2, hh); c.clip();
+            c.fillText(iv.name.replace(/^CMD_/, ""), x0 + 3, yy + 8); c.restore(); c.font = FONT;
+          }
+          c.globalAlpha = 1;
+          this.hits.push({ x0, x1, y0: yy, y1: yy + hh, iv, weak: true });
+        }
+      }
+      for (const e of ev.events) {  // events are drawn on the module row, and on their function row when the module is expanded
+        for (const r of [row[e.module], row[laneKey(e.module, e.func ?? "")]]) {
+          if (!r) continue;
+          const y = r.y, x = xOf(cv, e.ts), sub = r.fn != null;
+          if (x < LEFT || x > W) continue;
+          if (e.level === "alarm") {
+            c.fillStyle = "#dc2626";
+            c.beginPath(); c.moveTo(x, y + 2); c.lineTo(x + 5, y + 11); c.lineTo(x - 5, y + 11); c.closePath(); c.fill();
+          } else if (e.level === "clear") {  // ○ green: cleared; orange: RESET action when alarm_done is set
+            c.strokeStyle = e.alarm_state === "RESET" && S.summary.use_done ? "#d97706" : "#16a34a"; c.lineWidth = 1.5;
+            c.beginPath(); c.arc(x, y + 7, 3.5, 0, 7); c.stroke(); c.lineWidth = 1;
+          } else if (e.level === "abn") {  // ◆ red: abnormal ([parser] abnormal)
+            c.fillStyle = "#dc2626";
+            c.beginPath(); c.moveTo(x, y + 2); c.lineTo(x + 4, y + 7); c.lineTo(x, y + 12); c.lineTo(x - 4, y + 7); c.closePath(); c.fill();
+          } else {
+            c.fillStyle = e.color || S.colors[e.module]; c.fillRect(x - 1, y + (sub ? 3 : 6), 2, sub ? r.h - 9 : 16);
+          }
+          this.hits.push({ x0: x - 5, x1: x + 5, y0: y, y1: y + r.h, e });
+        }
+      }
+      if (ev.truncated) { c.fillStyle = "#b45309"; c.fillText("Too many events: plain events thinned out (alarms all shown); zoom in to see every one", LEFT + 4, H - 3); }
+    }
+    // blue dashed line = current position of the log list; Shift+drag selection
+    const x = S.cursorTs ? xOf(cv, S.cursorTs) : -1;
+    if (x >= LEFT && x <= W) {
+      c.strokeStyle = "#2563eb"; c.setLineDash([4, 3]);
+      c.beginPath(); c.moveTo(x, AXIS_H - 6); c.lineTo(x, H); c.stroke(); c.setLineDash([]);
+    }
+    if (this.drag && this.drag.brush) {
+      c.fillStyle = "rgba(37,99,235,0.15)";
+      c.fillRect(Math.min(this.drag.x, this.drag.bx), AXIS_H, Math.abs(this.drag.bx - this.drag.x), H - AXIS_H);
+    }
+  },
+  hit(x, y) {  // clickable object closest to the mouse; events win over intervals
+    let best = null, bd = 1e9;
+    for (const h of this.hits) {
+      if (x < h.x0 || x > h.x1 || y < h.y0 || y > h.y1) continue;
+      const d = h.weak ? 50 : Math.abs(x - (h.x0 + h.x1) / 2);
+      if (d < bd) { bd = d; best = h; }
+    }
+    return best;
+  },
+  tip(hit) {
+    if (hit.toggle) return S.open.has(hit.toggle) ? "Click to collapse functions" : "Click to expand by function";
+    if (hit.e) return `${fmtFull(hit.e.ts)}  ${hit.e.module}${hit.e.func ? " · " + hit.e.func : ""}\n${hit.e.event || ""}` +
+      (alarmName(hit.e.alarm) ? "\nName " + alarmName(hit.e.alarm) : "") + (alarmDesc(hit.e.alarm) ? "\n" + alarmDesc(hit.e.alarm) : "");
+    const iv = hit.iv;
+    let s = `${iv.module}${iv.func ? " · " + iv.func : ""}  ${iv.name}\n${fmtTs(iv.t0)} ~ ${fmtTs(iv.t1, false)}  (${iv.t1 - iv.t0} s)` +
+      (iv.closed ? (iv.end_event ? "\nEnd: " + iv.end_event : "") : "\nNo end seen");
+    if (iv.kind === "alarm" && alarmName(iv.name.slice(6))) s += "\nName " + alarmName(iv.name.slice(6));
+    if (iv.kind === "alarm" && alarmDesc(iv.name.slice(6))) s += "\n" + alarmDesc(iv.name.slice(6));
+    return s;
+  },
+};
+(() => {  // swimlane mouse actions: wheel zoom, drag pan, Shift+drag select time range, double-click reset, click jump
+  const cv = lanes.cv, tipEl = $("tip");
+  cv.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const tc = tOf(cv, e.offsetX), k = e.deltaY > 0 ? 1.25 : 0.8;
+    const t0 = tc - (tc - S.view.t0) * k, t1 = tc + (S.view.t1 - tc) * k;
+    if (t1 - t0 < 10) return;
+    S.view = { t0, t1 }; lanes.draw(); viewChanged();
+  }, { passive: false });
+  cv.addEventListener("mousedown", (e) => { lanes.drag = { x: e.offsetX, bx: e.offsetX, v: { ...S.view }, moved: false, brush: e.shiftKey }; });
+  window.addEventListener("mousemove", (e) => {
+    const d = lanes.drag; if (!d) return;
+    const x = e.clientX - cv.getBoundingClientRect().left;
+    if (Math.abs(x - d.x) > 3) d.moved = true;
+    if (d.brush) { d.bx = x; lanes.draw(); return; }
+    const dt = ((x - d.x) / (cv.clientWidth - LEFT - 8)) * (d.v.t1 - d.v.t0);
+    S.view = { t0: d.v.t0 - dt, t1: d.v.t1 - dt }; lanes.draw(); viewChanged();
+  });
+  window.addEventListener("mouseup", (e) => {
+    const d = lanes.drag; if (!d) return;
+    lanes.drag = null;
+    if (d.brush && d.moved) {  // Shift+drag: show only this time range
+      const a = tOf(cv, Math.min(d.x, d.bx)), b = tOf(cv, Math.max(d.x, d.bx));
+      S.view = { t0: a, t1: b };
+      S.trace = { t0: Math.floor(a), t1: Math.ceil(b), label: "Time range" }; S.selId = null;
+      setFilterFromUI(); return;
+    }
+    if (d.moved) return;
+    const hit = lanes.hit(d.x, e.clientY - cv.getBoundingClientRect().top);
+    if (hit && hit.toggle) { toggleOpen(hit.toggle); tipEl.classList.add("hidden"); }
+    else if (hit && hit.e) jumpToId(hit.e.id);
+    else if (hit && hit.iv) jumpToTs(hit.iv.t0);
+    else if (d.x > LEFT) jumpToTs(tOf(cv, d.x));
+  });
+  cv.addEventListener("dblclick", () => {
+    if (!S.summary) return;
+    S.view = { t0: S.summary.t_min, t1: Math.max(S.summary.t_max, S.summary.t_min + 60) };
+    lanes.draw(); viewChanged();
+  });
+  cv.addEventListener("mousemove", (e) => {
+    const hit = lanes.drag ? null : lanes.hit(e.offsetX, e.offsetY);
+    if (!hit) { tipEl.classList.add("hidden"); return; }
+    tipEl.textContent = lanes.tip(hit); tipEl.classList.remove("hidden");
+    tipEl.style.left = Math.min(e.offsetX + 12, cv.clientWidth - tipEl.offsetWidth - 4) + "px";
+    tipEl.style.top = (e.offsetY + 14) + "px";
+  });
+  cv.addEventListener("mouseleave", () => tipEl.classList.add("hidden"));
+})();
+
+// ===== Regex check: how much each regex hits, what it captures, and the "shape" of lines it missed (letter -> a, digit -> 9, Japanese -> あ) =====
+// The regexes live in [parser] of logview.ini (written by the company AI); this page shows how well they work, and "Copy for company AI" packs the results for it to fix.
+const RX_LABEL = { module: "Module", function: "Function", source: "Source file", time: "Time", event: "Event",
+  alarm: "Alarm raised", alarm_reset: "Alarm cleared (RESET)", alarm_done: "Reset done", alarm_code: "Alarm code",
+  alarm_name: "Alarm name map", alarm_level: "Alarm level", abnormal: "Abnormal" };
+const RX_MIN = { module: 95, time: 95, source: 95, function: 80, alarm_code: 100 }; // hit rate below this is marked red
+const MISS_LABEL = { no_module: "Lines with no module found (and not an indented continuation line)", no_time: "Lines with a module but no time",
+  no_func: "Lines with a module but no function name", no_src: "Lines with a module but no source file",
+  no_code: "Alarm-raised lines with no alarm code" };
+async function loadHealth() {
+  const showEx = store("rxExamples") !== "0";
+  const [h, rc] = await Promise.all([api("health"), api("regexcheck", { examples: showEx ? 1 : 0 })]);
+  const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+  const cell = (v, bad) => `<td class="n ${bad ? "bad" : ""}">${v}</td>`;
+  const table = (head, rows) => rows.length ? `<table><tr>${head.map((k) => `<th>${k}</th>`).join("")}</tr>${rows.join("")}</table>` : `<p class="hint">None</p>`;
+  let html = `<div class="bar"><button id="rxPack" class="ai" title="Conventions + current regexes + hit rates + missed examples, to paste into the company AI so it fixes [parser]">Copy for company AI</button>
+    <label class="hint"><input type="checkbox" id="rxEx" ${showEx ? "checked" : ""}> Include raw examples (company AI only)</label>
+    <span class="hint">Paste the ini snippet the company AI returns into <code>${esc(rc.config)}</code>, click "Re-parse", then come back to check the hit rates.</span></div>`;
+  if (rc.warnings.length) html += `<div class="hint bad">${rc.warnings.map(esc).join("<br>")}</div>`;
+  for (const f of rc.formats) {
+    html += `<h2>${esc(f.format)} <span class="hint">used on ${f.nfiles} files${f.format !== "[parser]" ? ` (files = ${esc(f.files.join(", "))})` : ""}, encoding ${esc(f.encodings.join(", "))}</span></h2>`;
+    html += table(["Item", "Regex", "Lines checked", "Hits", "Hit rate", "Captured values (top 10)"], f.fields.map((r) => {
+      const p = pct(r.hit, r.base), min = RX_MIN[r.key];
+      const vals = r.top.slice(0, 10).map(([v, n]) => `${esc(v)}×${n}`).join(", ") + (r.nvalues > 10 ? ` … ${r.nvalues} in total` : "");
+      return `<tr><td><b>${RX_LABEL[r.key] || r.key}</b><br><span class="hint">${r.key}</span></td><td class="rx">${esc(r.pattern) || `<span class="hint">(empty, not used)</span>`}${r.note ? `<div class="hint">; ${esc(r.note).replace(/\n/g, "<br>; ")}</div>` : r.default ? `<div class="hint">(built-in default, not yet adapted to the real logs)</div>` : ""}</td>${cell(r.base.toLocaleString())}${cell(r.hit.toLocaleString())}${min ? cell(p + "%", r.base > 0 && p < min) : cell("—")}<td class="vals">${vals}</td></tr>`;
+    }));
+    const groups = {};
+    for (const m of rc.misses.filter((m) => m.format === f.format)) (groups[m.kind] ||= []).push(m);
+    for (const [kind, ms] of Object.entries(groups)) {
+      html += `<h3>${MISS_LABEL[kind] || kind}</h3>` + table(["Module", "Count", "Shape", ...(showEx ? ["Raw example"] : [])], ms.map((m) =>
+        `<tr><td>${esc(m.module)}</td>${cell(m.n)}<td><code>${esc(m.shape)}</code></td>${showEx ? `<td class="ex">${esc(m.example)}</td>` : ""}</tr>`));
+    }
+  }
+  html += `<p class="hint">Red: module, time, source file below 95%, function below 80%, alarm code below 100%. Events and alarms are just line counts with no target. Up to 30 shapes are listed per kind.</p>`;
+  html += `<h2>By module</h2>` + table(["Module", "Records", "No time", "No function", "No source file", "Events", "Alarms", "With continuation"], h.modules.map((m) => {
+    const nt = pct(m.no_time, m.records), nf = pct(m.no_func, m.records), ns = pct(m.no_src, m.records);
+    return `<tr><td><b>${esc(m.module)}</b></td>${cell(m.records.toLocaleString())}${cell(nt + "%", nt > 5)}${cell(nf + "%", nf > 20)}${cell(ns + "%", ns > 5)}${cell(m.events)}${cell(m.alarms)}${cell(m.with_cont)}</tr>`;
+  }));
+  html += `<p class="hint">Module "?" means lines at the start of a file before any module tag.</p>`;
+  html += `<h2>By file</h2>` + table(["File", "Regex set", "Size", "Lines", "Records", "Encoding", "Decode errors", "No time at start"], h.files.map((f) =>
+    `<tr><td><code>${esc(f.path)}</code></td><td>${esc(f.format)}</td>${cell((f.size / 1e6).toFixed(1) + " MB")}${cell(f.lines.toLocaleString())}${cell(f.records.toLocaleString())}<td>${esc(f.encodings)}</td>${cell(f.decode_errors, f.decode_errors > 0)}${cell(f.no_time_at_start, f.no_time_at_start > 0)}</tr>`));
+  html += `<p class="hint">${h.built_sec != null ? `Parse time: ${h.built_sec} s` : ""}</p>`;
+  $("health").innerHTML = html;
+  $("rxEx").onchange = (e) => { store("rxExamples", e.target.checked ? "1" : "0"); loadHealth(); };
+  $("rxPack").onclick = async () => {
+    const text = await (await fetch(apiUrl("regexpack", { examples: $("rxEx").checked ? 1 : 0 }))).text();
+    showTextDlg("Copy for company AI: fix parser regexes", text, "regex_check.txt",
+      $("rxEx").checked ? "Contains raw log examples; paste only into the internal company AI." : "No raw log text, only statistics and shapes.");
+  };
+}
+
+// ===== Export =====
+$("btnExport").onclick = () => {
+  const d = new Date();
+  const name = `log_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.txt`;
+  location.href = apiUrl("export", { f: S.f, name });
+};
+// text dialog: used by Export for AI and by the regex check pack
+let dlgFile = "ai_analyze.txt";
+function showTextDlg(title, text, file, hint) {
+  $("aiTitle").textContent = title;
+  $("aiHint").textContent = hint;
+  dlgFile = file;
+  $("aiText").value = text;
+  $("aiCount").textContent = `${text.length.toLocaleString()} chars`;
+  $("aiDlg").classList.remove("hidden");
+}
+$("btnAi").onclick = async () => {
+  const text = await (await fetch(apiUrl("ai", { f: S.f, ...(S.trace && S.trace.anchor ? { anchor: S.trace.anchor } : {}) }))).text();
+  showTextDlg("Export for AI: fault analysis", text, "ai_analyze.txt", "Copy and paste into the company AI; if too long, download as .txt and upload it.");
+};
+$("aiClose").onclick = () => $("aiDlg").classList.add("hidden");
+$("aiDlg").addEventListener("click", (e) => { if (e.target.id === "aiDlg") $("aiDlg").classList.add("hidden"); });
+$("aiCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("aiText").value); } catch { $("aiText").select(); document.execCommand("copy"); }
+  $("aiCopy").textContent = "Copied"; setTimeout(() => ($("aiCopy").textContent = "Copy"), 1500);
+};
+$("aiSave").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([$("aiText").value], { type: "text/plain;charset=utf-8" }));
+  a.download = dlgFile; a.click(); URL.revokeObjectURL(a.href);
+};
+
+// ===== Tabs, startup =====
+function showTab(name) {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === name));
+  for (const p of ["main", "health"]) $(p).classList.toggle("hidden", p !== name);
+  if (name === "main") { lanes.resize(); renderRows(); }
+}
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
+window.addEventListener("resize", () => { lanes.resize(); renderRows(); });
+$("btnOpen").onclick = () => openFolder(false);
+$("btnReparse").onclick = () => openFolder(true);
+$("folder").addEventListener("keydown", (e) => { if (e.key === "Enter") openFolder(false); });
+$("folder").value = store("folder") || "";
+lanes.resize();
+pollStatus();
+</script>
+</body>
+</html>

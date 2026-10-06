@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+my_config/
+# never commit logs or alarm tables (real or test)
+*.log
+*.txt
+*.csv
