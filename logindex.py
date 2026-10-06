@@ -546,11 +546,13 @@ class Index:
         }
 
     def tree(self):
-        """The module -> sub-module tree on the left: {module: [[sub-module, lines], ...]}, by line count, most first. None is ""."""
+        """The module -> sub-module tree on the left: {module: [[sub-module, lines], ...]}. Sub-modules in alphabetical order,
+        case-insensitive with numbers by value (PUMP2 before PUMP10); names equal apart from case: uppercase first; none ("") last."""
         out = defaultdict(list)
-        for mod, sub, n in self.db.execute(
-                "SELECT module, IFNULL(sub, ''), COUNT(*) FROM lines GROUP BY 1, 2 ORDER BY 1, 3 DESC"):
+        for mod, sub, n in self.db.execute("SELECT module, IFNULL(sub, ''), COUNT(*) FROM lines GROUP BY 1, 2"):
             out[mod].append([sub, n])
+        for subs in out.values():
+            subs.sort(key=lambda x: (x[0] == "", _natural(x[0]), x[0]))
         return dict(out)
 
     def _where(self, f):

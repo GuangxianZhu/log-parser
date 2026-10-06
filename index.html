@@ -257,7 +257,7 @@ const ALARM_SHOW = 1000;                                   // max alarms drawn i
 const COLS = [["Time", 128], ["Module", 96], ["Function", 150], ["Source", 120], ["Event", 150], ["Log file:line", 210], ["Text", 0]];
 const S = {
   summary: null, modules: [], colors: {},
-  tree: {},             // module -> [[function, line count], ...] (function "" means no function name)
+  tree: {},             // module -> [[sub-module, line count], ...] in alphabetical order ("" = none, last)
   sel: {},              // module -> Set(selected functions)
   open: new Set(),      // expanded modules
   f: {}, count: 0, pages: new Map(), selId: null,      // list: filter, hit count, fetched pages, selected row
