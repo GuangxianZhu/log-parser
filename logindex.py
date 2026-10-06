@@ -13,6 +13,7 @@ only has the logic that uses them:
 - Alarm name: lines with both code and name build the alarm_names table; alarm lines with only the name are mapped back to the code before pairing
 - Alarm level: goes to the most recent alarm of the same module (same line or within LEVEL_WINDOW records after it), stored in alarm_levels
 - Abnormal ([parser] abnormal): level = 'abn', drawn as a red diamond in the swimlanes
+- [exclude] modules / submodules: those records and their continuation lines are dropped while parsing
 - Rolling files (log0058.log -> log0059.log): the last record of one file is joined to the start of the next
 
 The index is cached at ~/.logview_cache/<folder hash>.sqlite and rebuilt when the log files or the config change.
@@ -34,7 +35,7 @@ import sqlite3
 import time
 from collections import Counter, defaultdict
 
-SCHEMA_VERSION = "minimal-8"   # bump when the table layout or stored labels change; old caches are then invalidated
+SCHEMA_VERSION = "minimal-9"   # bump when the table layout or stored labels change; old caches are then invalidated
 
 LEVEL_WINDOW = 20   # when the alarm level comes after the alarm, how many records of the same module to look ahead
 # A captured time outside this range is not a real time (e.g. a serial number 0000000001 or 9999999999 that happens to be 10 digits);
@@ -160,7 +161,7 @@ class Index:
             PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
             CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, size INT, lines INT,
-                               records INT, encodings TEXT, decode_errors INT, no_time_at_start INT,
+                               records INT, excluded INT, encodings TEXT, decode_errors INT, no_time_at_start INT,
                                format TEXT);
             CREATE TABLE raw(ts INT, ts_inh INT, module TEXT, sub TEXT, func TEXT, src TEXT, srcline INT,
                              file_id INT, lineno INT, event TEXT, level TEXT,
@@ -237,8 +238,9 @@ class Index:
 
         stats, encs_seen = Counter(), Counter()
         batch = []
-        cur, last_ts, held = carry if carry else (None, None, [])  # held: records seen before any time
-        lineno = nrec = no_time_at_start = 0
+        cur, last_ts, held, skipping = carry if carry else (None, None, [], False)  # held: records seen before any time
+        lineno = nrec = no_time_at_start = excluded = 0  # skipping: inside a record of an [exclude]d module
+        excl_mod, excl_sub = bool(cfg.exclude_modules), bool(cfg.exclude_subs)
 
         def flush(rec):
             if rec is None:
@@ -257,6 +259,17 @@ class Index:
                     continue
                 indented = line[:1].isspace()
                 module = fmt.module.get(line)
+                if module is None and skipping:  # continuation line of an excluded record
+                    excluded += 1
+                    continue
+                if module is not None and (excl_mod or excl_sub):  # [exclude]: drop the record without parsing it further
+                    sub = (fmt.submodule.get(line) if fmt.submodule.rx is not None else fmt.function.get(line)) if excl_sub else None
+                    if cfg.excluded(module, sub):
+                        flush(cur)
+                        cur, skipping = None, True
+                        excluded += 1
+                        continue
+                skipping = False
                 if module is None:
                     if not indented:
                         rx[(F, "module")][0] += 1
@@ -397,7 +410,7 @@ class Index:
                     batch.clear()
 
         if keep_last:
-            out = (cur, last_ts, held)
+            out = (cur, last_ts, held, skipping)
         else:
             flush(cur)
             for p in held:  # no time all the way to the end
@@ -405,8 +418,8 @@ class Index:
                 batch.append(tuple(p))
             out = None
         db.executemany(INSERT, batch)
-        db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?)",
-                   (fid, rel, os.path.getsize(path), lineno, nrec,
+        db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,?,?,?,?)",
+                   (fid, rel, os.path.getsize(path), lineno, nrec, excluded,
                     ",".join(f"{k}:{v}" for k, v in encs_seen.most_common()),
                     stats["decode_errors"], no_time_at_start, F))
         return out
@@ -499,6 +512,7 @@ class Index:
         self.db.create_function("REGEXP", 2, _regexp, deterministic=True)
         self._filter_cache = {}
         self.total = self.db.execute("SELECT COUNT(*) FROM lines").fetchone()[0]
+        self.excluded = self.db.execute("SELECT IFNULL(SUM(excluded), 0) FROM files").fetchone()[0]
         self.modules = [r[0] for r in self.db.execute("SELECT DISTINCT module FROM lines ORDER BY module")]
         r = self.db.execute("SELECT MIN(ts), MAX(ts) FROM lines WHERE ts > 0").fetchone()
         self.t_min, self.t_max = r if r[0] is not None else (0, 0)
@@ -527,7 +541,7 @@ class Index:
             "trace_before": self.cfg.trace_before, "trace_after": self.cfg.trace_after,
             "alarm_table": self.alarm_table, "alarm_names": self.alarm_names,
             "config": self.cfg.path, "use_done": self.cfg.use_done, "warnings": self.cfg.warnings,
-            "has_sub": self.cfg.has_sub,
+            "has_sub": self.cfg.has_sub, "excluded": self.excluded,
             "tree": self.tree(),
         }
 
