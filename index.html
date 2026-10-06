@@ -239,6 +239,7 @@ const $ = (id) => document.getElementById(id);
 const PALETTE = ["#2563eb", "#059669", "#d97706", "#7c3aed", "#db2777", "#0891b2",
                  "#65a30d", "#ea580c", "#4f46e5", "#0d9488", "#9333ea", "#b45309"];
 const ROW_H = 20, PAGE = 200, MAX_SCROLL_PX = 8_000_000;   // log list
+const COPY_MAX = 50000;  // most lines that can be picked to copy at once
 const LANE_H = 34, SUB_H = 24, AXIS_H = 24;                // swimlanes: module row height, function row height, axis height
 let LEFT = 70;                                             // width of the name column left of the swimlanes (wider when functions are expanded)
 const FONT = "11px Segoe UI, Yu Gothic UI, Microsoft YaHei, sans-serif";
@@ -253,6 +254,7 @@ const S = {
   sel: {},              // module -> Set(selected functions)
   open: new Set(),      // expanded modules
   f: {}, count: 0, pages: new Map(), selId: null,      // list: filter, hit count, fetched pages, selected row
+  multi: new Set(), anchor: null,  // list: indexes of rows picked with Ctrl/Shift+click (to copy), and where the Shift range starts
   tz: "",  // time zone for showing/typing times: "" = browser local, else IANA name (see setTz)
   view: { t0: 0, t1: 1 }, trace: null, cursorTs: null,  // swimlanes: visible time range, trace range, current time of the list
   ev: null, alarms: [],
@@ -614,6 +616,8 @@ let listGen = 0, renderGen = 0;
 async function refreshList() {
   const gen = ++listGen;
   S.pages = new Map();
+  const fkey = JSON.stringify(S.f);
+  if (fkey !== S.multiKey) { S.multiKey = fkey; S.multi = new Set(); S.anchor = null; }  // the rows' indexes changed: drop the multi-selection
   const { count, error } = await api("count", { f: S.f });
   if (gen !== listGen) return;
   S.count = count;
@@ -649,15 +653,16 @@ async function renderRows() {
   const rows = pages.flat().slice(i0 - p0 * PAGE, i0 - p0 * PAGE + n);
   rowsEl.style.transform = `translateY(${list.scrollTop - (list.scrollTop % ROW_H)}px)`;
   let prevDate = null;
-  rowsEl.innerHTML = rows.map((r) => {
-    const cls = ["r", "row-grid", r.level === "alarm" || r.level === "clear" || r.level === "abn" ? r.level : "", r.id === S.selId ? "sel" : ""];
+  rowsEl.innerHTML = rows.map((r, k) => {
+    const sel = S.multi.size > 1 ? S.multi.has(i0 + k) : r.id === S.selId;
+    const cls = ["r", "row-grid", r.level === "alarm" || r.level === "clear" || r.level === "abn" ? r.level : "", sel ? "sel" : ""];
     const lines = r.text.split("\n");
     const more = lines.length > 1 ? `<span class="more">+${lines.length - 1} lines</span>` : "";
     const date = fmtTs(r.ts).slice(0, 5);
     const tcell = date === prevDate ? "&nbsp;".repeat(6) + fmtTs(r.ts, false) : fmtTs(r.ts);
     prevDate = date;
     const ev = r.alarm ? `${{ DONE: "Reset done ", RESET: S.summary.use_done ? "RESET " : "Cleared " }[r.alarm_state] || ""}${withName(r.alarm)}` : (r.event || "");
-    return `<div class="${cls.join(" ")}" data-id="${r.id}">
+    return `<div class="${cls.join(" ")}" data-id="${r.id}" data-i="${i0 + k}">
       <span class="${r.ts_inh ? "inh" : ""}" title="${r.ts_inh ? "No time on this line; time inherited from previous line" : r.ts}">${tcell}</span>
       <span class="modc" style="color:${S.colors[r.module] || "#555"}">${esc(r.module)}</span>
       <span title="${esc(r.func)}">${esc(r.func)}</span>
@@ -670,10 +675,82 @@ async function renderRows() {
   if (rows.length && S.cursorTs !== rows[0].ts) { S.cursorTs = rows[0].ts; lanes.draw(); }
 }
 list.addEventListener("scroll", () => requestAnimationFrame(renderRows));
+// Click: one row. Ctrl/Cmd+click: add or remove a row. Shift+click: every row from the last clicked one to here.
+// With 2+ rows picked, the bottom panel offers "Copy"; Ctrl+C on the list copies them too.
+rowsEl.addEventListener("mousedown", (e) => { if (e.shiftKey) e.preventDefault(); });  // Shift+click: don't select page text
 rowsEl.addEventListener("click", (e) => {
   const el = e.target.closest(".r"); if (!el) return;
-  selectRow(rowsEl._rows.find((x) => x.id === +el.dataset.id));
+  const i = +el.dataset.i, r = rowsEl._rows.find((x) => x.id === +el.dataset.id);
+  if (e.shiftKey && S.anchor != null) {
+    if (!(e.ctrlKey || e.metaKey)) S.multi = new Set();
+    const [a, b] = S.anchor < i ? [S.anchor, i] : [i, S.anchor];
+    if (b - a + 1 > COPY_MAX) { alert(`At most ${COPY_MAX.toLocaleString()} lines can be selected; use "Export as text" for more`); return; }
+    for (let j = a; j <= b; j++) S.multi.add(j);
+  } else if (e.ctrlKey || e.metaKey) {
+    if (S.multi.size === 0 && S.anchor != null) S.multi.add(S.anchor);  // Ctrl+click after a plain click keeps that first row
+    S.multi.has(i) ? S.multi.delete(i) : S.multi.add(i);
+    S.anchor = i;
+  } else {
+    S.multi = new Set([i]); S.anchor = i;
+  }
+  if (S.multi.size > 1) { S.selId = null; showMulti(); renderRows(); }
+  else if (S.multi.size === 1) { S.anchor = [...S.multi][0]; if (S.anchor === i) selectRow(r); else jumpToIndex(S.anchor); }
+  else { S.selId = null; renderRows(); showMulti(); }
 });
+// rows picked with Ctrl/Shift+click, in list order (fetched from the server in chunks)
+async function multiRows() {
+  const idx = [...S.multi].sort((a, b) => a - b), out = [], lgen = listGen;
+  for (let k = 0; k < idx.length;) {  // runs of consecutive indexes -> page requests of up to 1000 rows
+    let j = k;
+    while (j + 1 < idx.length && idx[j + 1] === idx[j] + 1 && idx[j + 1] - idx[k] < 1000) j++;
+    out.push(...(await api("page", { f: S.f, offset: idx[k], limit: idx[j] - idx[k] + 1 })).rows);
+    if (lgen !== listGen) return null;  // the list changed meanwhile
+    k = j + 1;
+  }
+  return out;
+}
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); }
+  catch { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
+  if (btn) { const old = btn.textContent; btn.textContent = "Copied"; setTimeout(() => (btn.textContent = old), 1200); }
+}
+async function copyMulti(withLoc, btn) {
+  const rows = await multiRows();
+  if (!rows) return;
+  // raw lines (continuation lines included); with location: "file:line<TAB>" before each record, like "Export as text"
+  await copyText(rows.map((r) => (withLoc ? `${r.file}:${r.lineno}\t` : "") + r.text.replace(/\n/g, withLoc ? "\n\t" : "\n")).join("\n") + "\n", btn);
+}
+function showMulti() {
+  if (S.multi.size <= 1) {
+    if (!S.selId) $("detail").innerHTML = `<span class="hint">Click a log line to see its full text here. Ctrl+click or Shift+click to pick several lines and copy them.</span>`;
+    return;
+  }
+  $("detail").innerHTML = `<div class="where"><b>${S.multi.size.toLocaleString()} lines selected</b>
+    <button id="mCopy" title="Raw log lines with continuation lines (Ctrl+C on the list does the same)">Copy</button>
+    <button id="mCopyLoc" title="Each record starts with file:line and a TAB, like Export as text">Copy with file:line</button>
+    <button id="mClear">Clear selection</button>
+    <span class="hint">Ctrl+click: add/remove a line · Shift+click: select a range</span></div><div class="hint" id="mPreview">…</div>`;
+  $("mCopy").onclick = (e) => copyMulti(false, e.target);
+  $("mCopyLoc").onclick = (e) => copyMulti(true, e.target);
+  $("mClear").onclick = () => { S.multi = new Set(); S.anchor = null; renderRows(); showMulti(); };
+  const n = S.multi.size;
+  if (n <= 2000) multiRows().then((rows) => {  // preview of the first lines
+    if (!rows || S.multi.size !== n || !$("mPreview")) return;
+    $("mPreview").className = "";
+    $("mPreview").textContent = rows.slice(0, 50).map((r) => r.text).join("\n") + (rows.length > 50 ? `\n… (${rows.length - 50} more)` : "");
+  });
+  else $("mPreview").textContent = "";
+}
+document.addEventListener("keydown", (e) => {  // Ctrl+C with lines picked in the list (and no text selected on the page): copy them
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "c" || S.multi.size < 2) return;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName) || String(getSelection())) return;
+  e.preventDefault(); copyMulti(false, $("mCopy"));
+});
+async function jumpToIndex(i) {
+  scrollToIndex(i);
+  const r = (await getPage(Math.floor(i / PAGE)))[i % PAGE];
+  if (r) selectRow(r);
+}
 function selectRow(r) {  // bottom panel shows full text (with continuation lines), file and line number, alarm description
   S.selId = r.id;
   const desc = r.alarm ? alarmDesc(r.alarm) : "";
@@ -687,15 +764,12 @@ function selectRow(r) {  // bottom panel shows full text (with continuation line
     ${desc || alarmName(r.alarm) ? `<br><span style="color:var(--alarm)">${esc(withName(r.alarm))}${desc ? ": " + esc(desc) : ""}</span>` : ""}</div><div>${esc(r.text)}</div>`;
   renderRows();
 }
-$("detail").addEventListener("click", async (e) => {  // "Copy path" / "Copy file:line"
-  const b = e.target.closest("button[data-copy]"); if (!b) return;
-  try { await navigator.clipboard.writeText(b.dataset.copy); }
-  catch { const t = document.createElement("textarea"); t.value = b.dataset.copy; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); }
-  const old = b.textContent; b.textContent = "Copied"; setTimeout(() => (b.textContent = old), 1200);
+$("detail").addEventListener("click", (e) => {  // "Copy path" / "Copy file:line"
+  const b = e.target.closest("button[data-copy]"); if (b) copyText(b.dataset.copy, b);
 });
 async function jumpToId(id) {
   const { pos } = await api("locate", { f: S.f, id });
-  S.selId = id;
+  S.selId = id; S.multi = new Set([pos]); S.anchor = pos;
   scrollToIndex(pos);
   const r = (await getPage(Math.floor(pos / PAGE))).find((x) => x.id === id);
   if (r) selectRow(r);
