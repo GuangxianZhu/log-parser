@@ -40,12 +40,15 @@ DEFAULT_INI = r"""; Config for the log analyzer (the only config file). Edit it 
 encodings = utf-8, cp932
 ; Which files to pick up when scanning a folder (comma-separated)
 files = *.log, *.txt
-; Module tag, group module, e.g. (TANK1) (HEAT1). A line without a module tag is a continuation line of the previous one
+; Module tag, group module, e.g. (TANK1) (HEAT1). A line without a module tag is a continuation line of the previous one.
+;   It may also capture the sub-module in the same match, group sub (sub2, sub3... for several styles), e.g.
+;   \((?P<module>[A-Z]{2,}\d*)\)\s*\[(?P<sub>\w+)\] for (TANK1) [PUMP]. Then submodule below is only a fallback
 module = \((?P<module>[A-Z]{2,}\d*)\)
 ; Function name, group func. If there are several styles, use func, func2, func3...; the first one found wins
 function = \b(?P<func>[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)|\b(?P<func2>[A-Za-z_]\w*)\(\)
 ; Sub-module (may be empty), group sub; several styles: sub, sub2, sub3... The second level under a module: the tree on the left,
-;   the per-sub-module swimlane rows and the module filter use it. Empty = the function name is the second level
+;   the per-sub-module swimlane rows and the module filter use it. Searched separately on the line; if the module regex
+;   has a sub group, that wins and this is only used when it captured nothing. Both empty = the function name is the second level
 submodule =
 ; Source file, group file; line number in group line (optional)
 source = (?P<file>[\w\-]+\.(?:cpp|cc|c|hpp|h))(?:\((?P<line>\d+)\))?
@@ -154,7 +157,7 @@ OLD_DEFAULTS = {
     ("parser", "alarm_code"): {r"alarmindex:\s*([0-9A-Fa-f]{4})"},
 }
 
-# Comment lines of the [parser] section in the earlier Chinese template, as note_digest() values.
+# Comment lines of the [parser] section in earlier templates (the Chinese one, and English lines since reworded), as note_digest() values.
 # Users' logview.ini files generated from that template still contain these lines; they are template help,
 # not notes the company AI wrote, so they must not be carried into the regex pack. Stored as digests so the
 # old Chinese text does not have to stay in the code.
@@ -163,6 +166,7 @@ OLD_TEMPLATE_NOTES = {
     "32257a9fd242", "5a64ff3b822c", "5dd5acf57329", "640d9285c8f8", "755132aa85e2", "7d489960c8ea",
     "8cd6c8a3d61c", "9c35fa87ca43", "c028b527d07d", "c0fba7cae2ee", "c8c59b121086", "cd6a3bfafe01",
     "df4309bb5edc", "e5ea0c28ff1b", "fd8608f02f3a",
+    "3b8dd3838315", "f821ecac04c4",  # module / submodule help of the English template before "module may capture sub"
 }
 
 
@@ -188,7 +192,7 @@ FIELDS = {
     "abnormal": "what",    # without a group, the whole matched text is used
 }
 OPTIONAL = {"submodule", "alarm_done", "alarm_name", "alarm_level", "abnormal"}   # may be empty; empty = not used
-ALT = {"source": "line", "alarm_code": "name", "alarm_name": "code"}  # second value that can be extracted besides the main one
+ALT = {"source": "line", "alarm_code": "name", "alarm_name": "code", "module": "sub"}  # second value that can be extracted besides the main one
 
 
 @dataclass
@@ -260,6 +264,11 @@ class Field:
         m = self.rx.search(line)
         return self.pick(m) if m else None
 
+    def get_both(self, line):
+        """(value, second value) from one match; (None, None) if it does not match."""
+        m = self.rx.search(line) if self.rx is not None else None
+        return (self.pick(m), self.pick_alt(m)) if m else (None, None)
+
 
 @dataclass
 class Format:
@@ -280,6 +289,24 @@ class Format:
     @property
     def label(self):
         return f"[parser.{self.name}]" if self.name else "[parser]"
+
+    @property
+    def sub_in_module(self):
+        """The module regex also captures the sub-module (group sub, sub2...), in the same match as the module."""
+        return bool(self.module.alt)
+
+    @property
+    def has_sub(self):
+        """This style has a sub-module (from the module regex or from submodule); else the function is the second level."""
+        return self.sub_in_module or self.submodule.rx is not None
+
+    def sub_of(self, line, msub, func):
+        """Second level under the module: sub group of the module match, else submodule, else (no sub-module configured) the function."""
+        if msub:
+            return msub
+        if self.submodule.rx is not None:
+            return self.submodule.get(line)
+        return None if self.sub_in_module else func
 
 
 @dataclass
@@ -315,8 +342,9 @@ class Config:
 
     @property
     def has_sub(self):
-        """submodule is set (in [parser] or a [parser.<name>]): the second level under a module is the sub-module, else the function."""
-        return any(f.submodule.rx is not None for f in self.formats)
+        """A sub-module is configured (module with group sub, or submodule, in [parser] or a [parser.<name>]):
+        the second level under a module is the sub-module, else the function."""
+        return any(f.has_sub for f in self.formats)
 
     @property
     def use_done(self):

@@ -26,9 +26,9 @@ This section contains **only regexes**; all the tool's logic is in the code. The
 |---|---|---|---|
 | `encodings` | `utf-8, cp932` | (not a regex) | Encodings tried in order (cp932 is Shift_JIS) |
 | `files` | `*.log, *.txt` | (not a regex) | Which files in the log folder to read |
-| `module` | `(TANK1)`: 2+ uppercase letters plus digits in parentheses | `module` | A line without a module tag counts as a continuation line of the previous one, so every new line must match. `temp(C)` and `Foo()` are not taken as modules |
+| `module` | `(TANK1)`: 2+ uppercase letters plus digits in parentheses | `module`; optionally also `sub` (`sub2`, `sub3`…) | A line without a module tag counts as a continuation line of the previous one, so every new line must match. `temp(C)` and `Foo()` are not taken as modules. It may capture the sub-module in the same match, e.g. `\((?P<module>[A-Z]{2,}\d*)\)\s*\[(?P<sub>\w+)\]` for `(TANK1) [PUMP]`: the sub-module is then tied to the module tag's position (recommended) |
 | `function` | `Foo()` or `CClass::Foo` | `func`; for several forms use `func`, `func2`, `func3`… | Function name; the first one found is used. With `submodule` empty, this is what the tree on the left lists under each module |
-| `submodule` | (empty) | `sub`; for several forms use `sub`, `sub2`, `sub3`… | Optional sub-module: the second level under a module. When set, the tree on the left, the per-sub-module swimlane rows and the module filter group lines by it instead of the function name, and the log list shows it as `TANK1/xxx`. Empty: the function name is the second level |
+| `submodule` | (empty) | `sub`; for several forms use `sub`, `sub2`, `sub3`… | Optional sub-module: the second level under a module, searched separately on the line. If `module` has a `sub` group, that wins and this is only the fallback when it captured nothing. When either is set, the tree on the left, the per-sub-module swimlane rows and the module filter group lines by it instead of the function name, and the log list shows it as `TANK1/xxx`. Empty: the function name is the second level |
 | `source` | `xxx.cpp(123)` | `file`, line number `line` (optional) | Source file name and line number |
 | `time` | 10 or 13 digits | `time` | UNIX time; the captured value must be digits only. A line without a time inherits the time from the previous line. A value outside 2000–2100 (e.g. a serial number `0000000001`) is not taken as a time; the next match on the line is tried |
 | `event` | Words starting with `CMD_` | `event` | Captured automatically as events |
@@ -67,7 +67,7 @@ they appear nowhere (tree, swimlanes, log list, alarms, intervals, regex check, 
 | Entry | Default | Notes |
 |---|---|---|
 | `modules` | Empty | Module names, comma-separated; `*` and `?` wildcards, case-insensitive. E.g. `IOMON, SIM*, TANK9?` |
-| `submodules` | Empty | `module/sub-module`, e.g. `TANK*/PUMP, */DEBUG*`. Without a `/` it applies to any module (`DEBUG*` = `*/DEBUG*`). The sub-module is what `[parser] submodule` captures, or the function name when that is empty |
+| `submodules` | Empty | `module/sub-module`, e.g. `TANK*/PUMP, */DEBUG*`. Without a `/` it applies to any module (`DEBUG*` = `*/DEBUG*`). The sub-module is what the `sub` group of `[parser] module` or `[parser] submodule` captures, or the function name when neither is set |
 
 The status bar shows how many lines were left out; the "By file" counts on the Regex check tab count only the lines kept.
 
