@@ -59,9 +59,13 @@ aside h3 a { font-weight: normal; font-size: 11px; margin-left: 6px; }
 #treeSec, aside section.grow { min-height: 60px; }
 #tree, #alarms { flex: 1; min-height: 0; overflow: auto; }
 #tree { font-size: 12px; }
-.trange { display: flex; gap: 4px; align-items: center; }
+.trange { display: flex; gap: 2px; align-items: center; }
 .trange > span { width: 34px; flex: none; }
-.trange input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; }
+.trange input { min-width: 0; font-family: var(--mono); font-size: 12px; }
+.trange input[type=date] { flex: 1; margin-right: 4px; }
+.trange input.hms { width: 2.6em; flex: none; text-align: center; padding: 2px 0; -moz-appearance: textfield; }
+.trange input.hms::-webkit-inner-spin-button, .trange input.hms::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.tbtns { display: flex; gap: 6px; align-items: center; }
 .hint.bad { color: var(--alarm); }
 #tree .mod, #tree .fn { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 #tree .fn { padding-left: 30px; }
@@ -174,10 +178,11 @@ canvas { display: block; width: 100%; cursor: crosshair; }
       <input id="q" placeholder="Keyword">
       <label><input type="checkbox" id="regex"> Regex</label>
       <input id="src" placeholder="Source file, e.g. tankctrl.cpp">
-      <div class="trange" title="To the second, both ends inclusive. Time only (hh:mm:ss) uses the first day of the logs; a 10-digit UNIX time also works">
-        <span>From</span><input id="tFrom" placeholder="2026-10-04 08:30:00" spellcheck="false"></div>
-      <div class="trange" title="To the second, both ends inclusive. Time only uses the same day as From">
-        <span>To</span><input id="tTo" placeholder="08:45:10" spellcheck="false"><button id="tGo">Find by time</button></div>
+      <div class="trange" id="tFrom" title="Date + hour : minute : second, in the selected time zone. No date: the first day of the logs. Empty hour: from 00:00:00; empty minute/second: 00">
+        <span>From</span><input type="date" data-k="d"><input class="hms" data-k="h" type="number" min="0" max="23" placeholder="hh">:<input class="hms" data-k="m" type="number" min="0" max="59" placeholder="mm">:<input class="hms" data-k="s" type="number" min="0" max="59" placeholder="ss"></div>
+      <div class="trange" id="tTo" title="Date + hour : minute : second, both ends inclusive. No date: the same day as From (the next day if the time is earlier than From). Empty hour: to 23:59:59; empty minute/second: 59">
+        <span>To</span><input type="date" data-k="d"><input class="hms" data-k="h" type="number" min="0" max="23" placeholder="hh">:<input class="hms" data-k="m" type="number" min="0" max="59" placeholder="mm">:<input class="hms" data-k="s" type="number" min="0" max="59" placeholder="ss"></div>
+      <div class="tbtns"><button id="tGo">Find by time</button><a href="#" id="tReset" class="hint">Clear times</a></div>
       <div class="hint bad hidden" id="tErr"></div>
       <label><input type="checkbox" id="eventsOnly"> Only events</label>
       <label><input type="checkbox" id="alarmsOnly"> Only alarms</label>
@@ -468,7 +473,7 @@ function setFilterFromUI() {
   if (S.trace) { f.t0 = S.trace.t0; f.t1 = S.trace.t1; }
   S.f = f;
   for (const [id, ts] of [["tFrom", S.trace && S.trace.t0], ["tTo", S.trace && S.trace.t1]])  // time boxes follow the current range (except the one being typed in)
-    if (document.activeElement !== $(id)) $(id).value = ts != null ? fmtFull(ts) : "";
+    if (!$(id).contains(document.activeElement)) setTimeBoxes(id, ts);
   $("rangeBox").classList.toggle("hidden", !S.trace);
   if (S.trace) $("rangeText").textContent = `${S.trace.label}: ${fmtTs(S.trace.t0)} ~ ${fmtTs(S.trace.t1, false)}`;
   refreshList();
@@ -478,42 +483,66 @@ for (const id of ["q", "src"]) $(id).addEventListener("input", debounce(setFilte
 for (const id of ["regex", "eventsOnly", "alarmsOnly", "abnOnly"]) $(id).addEventListener("change", setFilterFromUI);
 $("rangeClear").onclick = (e) => { e.preventDefault(); S.trace = null; $("tErr").classList.add("hidden"); setFilterFromUI(); };
 
-// exact time range: 2026-10-04 08:30:00, 2026/10/04 8:30:00, 10-04 08:30:00, 08:30:00 (date taken from base), 10- or 13-digit UNIX time
-function parseTime(text, base, isEnd) {
-  const t = text.trim();
-  if (!t) return null;
-  if (/^\d{10}$/.test(t)) return +t;
-  if (/^\d{13}$/.test(t)) return Math.floor(+t / 1000);
-  const m = t.match(/^(?:(?:(\d{4})[-\/.])?(\d{1,2})[-\/.](\d{1,2}))?[ T]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
-  if (!m || (!m[3] && m[4] == null)) return NaN;
-  const b = tzParts(base);  // times are typed in the selected time zone
-  const y = m[1] ? +m[1] : b.y, mo = m[2] ? +m[2] - 1 : b.mo - 1, d = m[3] ? +m[3] : b.d;
-  if (m[4] == null) return tzEpoch(y, mo, d, isEnd ? 23 : 0, isEnd ? 59 : 0, isEnd ? 59 : 0);  // date only: the whole day
-  return tzEpoch(y, mo, d, +m[4], +m[5], m[6] != null ? +m[6] : isEnd ? 59 : 0);
+// exact time range: From / To are each a date box + hour, minute, second boxes, read in the selected time zone
+const tBox = (id, k) => $(id).querySelector(`[data-k="${k}"]`);
+function setTimeBoxes(id, ts) {
+  const p = ts != null ? tzParts(ts) : null;
+  tBox(id, "d").value = p ? `${p.y}-${pad(p.mo)}-${pad(p.d)}` : "";
+  for (const k of ["h", "m", "s"]) tBox(id, k).value = p ? pad(p[k === "h" ? "h" : k === "m" ? "mi" : "s"]) : "";
+}
+// -> {d: [y, mo (0-11), d] or null, h, m, s: number or null}; NaN fields when out of range
+function readTimeBoxes(id) {
+  const dv = tBox(id, "d").value, v = {};
+  v.d = dv ? dv.split("-").map(Number).map((x, i) => (i === 1 ? x - 1 : x)) : null;
+  for (const [k, max] of [["h", 23], ["m", 59], ["s", 59]]) {
+    const t = tBox(id, k).value.trim();
+    v[k] = t === "" ? null : /^\d{1,2}$/.test(t) && +t <= max ? +t : NaN;
+  }
+  return v;
+}
+const timeBoxesEmpty = (v) => !v.d && v.h == null && v.m == null && v.s == null;
+function boxesToTs(v, day, isEnd) {  // day: [y, mo, d] used when no date was picked
+  const [y, mo, d] = v.d || day, e = isEnd ? 1 : 0;
+  if (v.h == null) return tzEpoch(y, mo, d, 23 * e, 59 * e, 59 * e);  // no hour: the whole day
+  return tzEpoch(y, mo, d, v.h, v.m ?? 59 * e, v.s ?? 59 * e);
+}
+// typing two digits moves on to the next box; leaving a box pads it to two digits
+for (const id of ["tFrom", "tTo"]) for (const k of ["h", "m", "s"]) {
+  const el = tBox(id, k);
+  el.addEventListener("input", () => {
+    if (el.value.length >= 2) { const nx = { h: "m", m: "s" }[k]; if (nx) tBox(id, nx).focus(); }
+  });
+  el.addEventListener("blur", () => { if (/^\d$/.test(el.value)) el.value = pad(el.value); });
 }
 function applyTimeRange() {
   if (!S.summary) return;
   const err = (msg) => { $("tErr").textContent = msg; $("tErr").classList.toggle("hidden", !msg); };
-  const from = $("tFrom").value, to = $("tTo").value;
-  if (!from.trim() && !to.trim()) { err(""); S.trace = null; setFilterFromUI(); return; }
-  const a = parseTime(from, S.summary.t_min, false);
-  const b = parseTime(to, a != null && !isNaN(a) ? a : S.summary.t_min, true);
-  if (Number.isNaN(a) || Number.isNaN(b)) { err("Can't read the time. E.g. 2026-10-04 08:30:00 or 08:30:00"); return; }
+  const from = readTimeBoxes("tFrom"), to = readTimeBoxes("tTo");
+  if (timeBoxesEmpty(from) && timeBoxesEmpty(to)) { err(""); S.trace = null; setFilterFromUI(); return; }
+  for (const v of [from, to]) {
+    if ([v.h, v.m, v.s].some(Number.isNaN)) { err("Hour 0-23, minute and second 0-59"); return; }
+    if (v.h == null && (v.m != null || v.s != null)) { err("Fill in the hour too"); return; }
+  }
+  const first = tzParts(S.summary.t_min), firstDay = [first.y, first.mo - 1, first.d];
+  const a = timeBoxesEmpty(from) ? null : boxesToTs(from, firstDay, false);
+  const fromDay = from.d || firstDay;
+  const b = timeBoxesEmpty(to) ? null : boxesToTs(to, a != null ? fromDay : firstDay, true);
   const t0 = a ?? S.summary.t_min;  // only one end given: the other is the start or end of the logs
   let t1 = b ?? S.summary.t_max;
   // To is a time only (no date) and earlier than From: the range crosses midnight, e.g. 23:50 -> 00:10 the next day
-  if (a != null && b != null && t1 < t0 && !/[-\/.]/.test(to)) t1 += 86400;
+  if (a != null && b != null && t1 < t0 && !to.d) t1 += 86400;
   if (t0 > t1) { err("Start time is after end time"); return; }
   err("");
   S.trace = { t0, t1, label: "Time range" };
   const pad_ = Math.max(0, (10 - (t1 - t0)) / 2);  // if the range is very short, the swimlanes still show at least 10 s
   S.view = { t0: t0 - pad_, t1: t1 + 1 + pad_ };
   S.selId = null;
-  $("tFrom").blur(); $("tTo").blur();
+  if ($("tFrom").contains(document.activeElement) || $("tTo").contains(document.activeElement)) document.activeElement.blur();
   setFilterFromUI();
 }
 $("tGo").onclick = applyTimeRange;
 for (const id of ["tFrom", "tTo"]) $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") applyTimeRange(); });
+$("tReset").onclick = (e) => { e.preventDefault(); setTimeBoxes("tFrom", null); setTimeBoxes("tTo", null); applyTimeRange(); };
 
 // ===== Alarm list, trace =====
 async function loadAlarms() {
