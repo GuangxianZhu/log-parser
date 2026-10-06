@@ -297,6 +297,10 @@ function tzEpoch(y, mo, d, h, mi, s) {  // wall clock in S.tz (mo 0-11, may over
   const t = w - tzOffset(w);
   return w - tzOffset(t);  // second pass: right across a DST change
 }
+const tzShort = (ts) => {  // "UTC+09:00" for the selected time zone at that moment
+  const off = tzOffset(ts), a = Math.abs(off) / 60;
+  return `UTC${off < 0 ? "-" : "+"}${pad(Math.floor(a / 60))}${a % 60 ? ":" + pad(a % 60) : ""}`;
+};
 function tzLabel(tz = S.tz) {
   const t = tz || LOCAL_TZ, off = tzOffset(Date.now() / 1000, makeTzFmt(tz)), a = Math.abs(off) / 60;
   return `${t} (UTC${off < 0 ? "-" : "+"}${pad(Math.floor(a / 60))}:${pad(a % 60)})`;
@@ -479,7 +483,7 @@ function setFilterFromUI() {
   for (const [id, ts] of [["tFrom", S.trace && S.trace.t0], ["tTo", S.trace && S.trace.t1]])  // time boxes follow the current range (except the one being typed in)
     if (!$(id).contains(document.activeElement)) setTimeBoxes(id, ts);
   $("rangeBox").classList.toggle("hidden", !S.trace);
-  if (S.trace) $("rangeText").textContent = `${S.trace.label}: ${fmtTs(S.trace.t0)} ~ ${fmtTs(S.trace.t1, false)}`;
+  if (S.trace) $("rangeText").textContent = `${S.trace.label}: ${fmtTs(S.trace.t0)} ~ ${fmtTs(S.trace.t1, fmtTs(S.trace.t1).slice(0, 5) !== fmtTs(S.trace.t0).slice(0, 5))}`;
   refreshList();
   lanes.resize(); viewChanged();
 }
@@ -861,13 +865,24 @@ const lanes = {
     // time axis, background of the trace range
     const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
     const step = steps.find((s) => s >= span / Math.max(1, (W - LEFT) / 110)) || 604800;
-    c.font = FONT; c.fillStyle = "#6b7280"; c.strokeStyle = "#eef0f3";
-    const off = step >= 3600 ? tzOffset(S.view.t0) : 0;  // hour/day ticks fall on whole hours/midnight of the selected time zone
-    for (let tk = Math.ceil((S.view.t0 + off) / step) * step - off; tk <= S.view.t1; tk += step) {
-      const x = xOf(cv, tk);
+    c.font = FONT; c.strokeStyle = "#eef0f3";
+    // ticks fall on whole seconds/minutes/hours/midnight of the selected time zone (offset taken per tick, so a DST change stays aligned).
+    // Label: MM-DD for day steps; else hh:mm (hh:mm:ss under one minute), with the date on the first tick and wherever the day changes
+    let prevDay = null, prevTk = -Infinity;
+    for (let tk = Math.ceil((S.view.t0 + tzOffset(S.view.t0)) / step) * step - tzOffset(S.view.t0); tk <= S.view.t1; tk += step) {
+      if (step >= 3600) { const o = tzOffset(tk), t = Math.round((tk + o) / step) * step - o; if (t > prevTk) tk = t; }
+      prevTk = tk;
+      const x = xOf(cv, tk), p = tzParts(tk), day = `${pad(p.mo)}-${pad(p.d)}`;
+      if (x < LEFT) continue;
       c.beginPath(); c.moveTo(x, AXIS_H - 4); c.lineTo(x, H); c.stroke();
-      c.fillText(step >= 86400 ? fmtTs(tk).slice(0, 5) : fmtTs(tk, !(step < 3600 * 6 && span < 86400)), x + 2, 14);
+      const hm = `${pad(p.h)}:${pad(p.mi)}` + (step < 60 ? `:${pad(p.s)}` : "");
+      const showDay = step >= 86400 || day !== prevDay;
+      c.fillStyle = showDay ? "#374151" : "#6b7280";
+      c.fillText(step >= 86400 ? day : showDay ? `${day} ${hm}` : hm, x + 2, 14);
+      prevDay = day;
     }
+    c.fillStyle = "#9ca3af";  // which time zone the axis is in
+    c.fillText(fitText(c, tzShort(S.view.t0), LEFT - 6), 4, 14);
     if (S.trace) {
       c.fillStyle = "rgba(37,99,235,0.06)";
       c.fillRect(xOf(cv, S.trace.t0), AXIS_H, xOf(cv, S.trace.t1) - xOf(cv, S.trace.t0), H - AXIS_H);
@@ -980,7 +995,7 @@ const lanes = {
     if (hit.e) return `${fmtFull(hit.e.ts)}  ${hit.e.module}${hit.e.sub ? " · " + hit.e.sub : ""}\n${hit.e.event || ""}` +
       (alarmName(hit.e.alarm) ? "\nName " + alarmName(hit.e.alarm) : "") + (alarmDesc(hit.e.alarm) ? "\n" + alarmDesc(hit.e.alarm) : "");
     const iv = hit.iv;
-    let s = `${iv.module}${iv.sub ? " · " + iv.sub : ""}  ${iv.name}\n${fmtTs(iv.t0)} ~ ${fmtTs(iv.t1, false)}  (${iv.t1 - iv.t0} s)` +
+    let s = `${iv.module}${iv.sub ? " · " + iv.sub : ""}  ${iv.name}\n${fmtTs(iv.t0)} ~ ${fmtTs(iv.t1, fmtTs(iv.t1).slice(0, 5) !== fmtTs(iv.t0).slice(0, 5))}  (${fmtDur(iv.t1 - iv.t0)})` +
       (iv.closed ? (iv.end_event ? "\nEnd: " + iv.end_event : "") : "\nNo end seen");
     if (iv.kind === "alarm" && alarmName(iv.name.slice(6))) s += "\nName " + alarmName(iv.name.slice(6));
     if (iv.kind === "alarm" && alarmDesc(iv.name.slice(6))) s += "\n" + alarmDesc(iv.name.slice(6));
