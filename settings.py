@@ -20,6 +20,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta, timezone
 
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 USER_DIR = os.path.join(TOOL_DIR, "my_config")
@@ -52,8 +53,13 @@ function = \b(?P<func>[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)|\b(?P<func2>[A-Za-z_]\w
 submodule =
 ; Source file, group file; line number in group line (optional)
 source = (?P<file>[\w\-]+\.(?:cpp|cc|c|hpp|h))(?:\((?P<line>\d+)\))?
-; UNIX time, group time: 10 digits (seconds) or 13 digits (milliseconds). A line without a time inherits the previous line's
-time = (?<![\w.])(?P<time>\d{10}|\d{13})(?![\w.])
+; Time, group time. UNIX or ISO is told apart automatically from what is captured: digits = UNIX time (10 digits seconds,
+;   13 digits milliseconds, decimals allowed); otherwise ISO 8601 such as 2024-01-02T10:00:00.123+09:00 (a space or / also works,
+;   offset optional), kept to the millisecond. A line without a time inherits the previous line's
+time = (?<![\w.])(?P<time>\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?|\d{10}(?:\d{3})?(?:\.\d{1,6})?)(?![\w.])
+; Time zone of ISO times written without an offset: empty = this computer's time zone; or UTC, +09:00, Asia/Tokyo.
+;   Not used for UNIX times or ISO times that carry Z / +09:00
+time_zone =
 ; Event name, group event
 event = \b(?P<event>CMD_[A-Z0-9_]+)\b
 ; Alarm raised: a line matching this is an alarm (no group needed, case-insensitive)
@@ -78,7 +84,7 @@ reset_same_module = yes
 reset_check = 60
 
 ; ---- Logs written in a different style: one [parser.<name>] section each; files says which files it covers ----
-; Only write the keys that differ from [parser] (encodings module function source time event alarm alarm_reset alarm_done alarm_code
+; Only write the keys that differ from [parser] (encodings time_zone module function source time event alarm alarm_reset alarm_done alarm_code
 ; alarm_name alarm_level abnormal);
 ; the rest come from [parser]. Each file uses the first section whose files matches, or [parser] if none does.
 ; files can be a file name (sys_*.log) or include a folder (sys/*.log). Example:
@@ -152,7 +158,7 @@ OLD_DEFAULTS = {
     # Below: the styles without named groups (they still work, but are replaced by the current default)
     ("parser", "function"): {r"\b([A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)|\b([A-Za-z_]\w*)\(\)"},
     ("parser", "source"): {r"([\w\-]+\.(?:cpp|cc|c|hpp|h))(?:\((\d+)\))?"},
-    ("parser", "time"): {r"(?<![\w.])(\d{10}|\d{13})(?![\w.])"},
+    ("parser", "time"): {r"(?<![\w.])(\d{10}|\d{13})(?![\w.])", r"(?<![\w.])(?P<time>\d{10}|\d{13})(?![\w.])"},
     ("parser", "event"): {r"\b(CMD_[A-Z0-9_]+)\b"},
     ("parser", "alarm_code"): {r"alarmindex:\s*([0-9A-Fa-f]{4})"},
 }
@@ -166,7 +172,7 @@ OLD_TEMPLATE_NOTES = {
     "32257a9fd242", "5a64ff3b822c", "5dd5acf57329", "640d9285c8f8", "755132aa85e2", "7d489960c8ea",
     "8cd6c8a3d61c", "9c35fa87ca43", "c028b527d07d", "c0fba7cae2ee", "c8c59b121086", "cd6a3bfafe01",
     "df4309bb5edc", "e5ea0c28ff1b", "fd8608f02f3a",
-    "3b8dd3838315", "f821ecac04c4",  # module / submodule help of the English template before "module may capture sub"
+    "3b8dd3838315", "f821ecac04c4", "a464fa38bd6f",  # module / submodule help before "module may capture sub", time help before ISO
 }
 
 
@@ -279,6 +285,7 @@ class Format:
     fields: dict         # key (module, function...) -> Field
     notes: dict = field(default_factory=dict)     # key -> ; comments above the regex (not the template's own), included in the pack for the company AI
     defaults: set = field(default_factory=set)    # keys still at the default (not adapted to the real logs)
+    tz: object = None    # time_zone: tzinfo for ISO times without an offset; None = this computer's local time
 
     def __getattr__(self, key):  # fmt.module, fmt.time ...
         try:
@@ -389,6 +396,24 @@ def _encodings(v, where):
         except LookupError:
             raise ValueError(f"{where}: unknown encoding \"{e}\" (e.g. utf-8, cp932, shift_jis)") from None
     return encs
+
+
+def _tz(v, where):
+    """time_zone = (empty / local) | UTC | +09:00 | Asia/Tokyo -> tzinfo, None for this computer's local time."""
+    v = v.strip()
+    if not v or v.lower() == "local":
+        return None
+    if v.upper() in ("UTC", "Z", "GMT"):
+        return timezone.utc
+    m = re.fullmatch(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", v, re.I)
+    if m:
+        return timezone((-1 if m.group(1) == "-" else 1) * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(v)
+    except Exception:
+        raise ValueError(f"{where}: unknown time zone \"{v}\" (use e.g. UTC, +09:00 or Asia/Tokyo; "
+                         "on a computer without the time zone database, +09:00 always works)") from None
 
 
 def _int(v, where, default):
@@ -529,6 +554,7 @@ def load(user_dir=None):
             if n:
                 note[k] = n
         return Format(name=name, files=files, encodings=_encodings(val("encodings"), f"[{sec}] encodings"), fields=fields, notes=note,
+                      tz=_tz(val("time_zone"), f"[{sec}] time_zone"),
                       defaults={k for k, f in fields.items() if f.pattern and f.pattern == base.get("parser", k).strip()})
 
     formats = [fmt(s[7:], s) for s in user.sections() if s.startswith("parser.")] + [fmt("", "parser")]
@@ -553,7 +579,7 @@ def load(user_dir=None):
     )
 
     # keys the tool doesn't know are ignored, so a typo (alarm_codes =, Module =) would silently fall back to the default: list them
-    known = {"parser": set(FIELDS) | {"encodings", "files", "reset_same_module", "reset_check"},
+    known = {"parser": set(FIELDS) | {"encodings", "files", "time_zone", "reset_same_module", "reset_check"},
              "view": {"trace_before", "trace_after", "alarm_table"}, "exclude": {"modules", "submodules"}, "ai": {"max_chars", "noise", "fold"}}
     known["parser."] = known["parser"] - {"reset_same_module", "reset_check"}
     for s in user.sections():

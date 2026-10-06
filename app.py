@@ -157,11 +157,12 @@ def _n(x):
     return str(int(x)) if x == int(x) else f"{x:g}"
 
 
-def _fmt(ts, date=False, tz=None):
-    """tz: a tzinfo, or None for this computer's local time."""
+def _fmt(ts, date=False, tz=None, ms=None):
+    """tz: a tzinfo, or None for this computer's local time. ms: add .mmm (None = only if ts has a fraction)."""
     if not ts:
         return "--"
-    return datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S" if date else "%H:%M:%S")
+    s = datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S" if date else "%H:%M:%S")
+    return s + f".{round(ts * 1000) % 1000:03d}" if (ts != int(ts) if ms is None else ms) else s
 
 
 def _fold(items):
@@ -244,7 +245,7 @@ def build_ai_text(ix, f, anchor_ts=None, tz=None):
     if anchor_ts is None:
         first = next((it for it in kept if it["alarm"] and it["state"] == "SET"), None)
         anchor_ts = first["ts"] if first else kept[len(kept) // 2]["ts"] if kept else tss[0]
-    anchor_ts = int(anchor_ts)
+    anchor_ts = float(anchor_ts)
 
     # Header
     def mod_name(m):
@@ -269,7 +270,7 @@ def build_ai_text(ix, f, anchor_ts=None, tz=None):
             head.append(f"  - {code}{(' = ' + name) if name else ''} ({it['module']}, first at {_fmt(it['ts'], False, tzi)})"
                         f"{(': ' + desc) if desc else ''}")
     # 3. Fit the size limit
-    lines = [(it["note"] + "\n" if it["note"] else "") + f"{_fmt(it['ts'], False, tzi)} {it['text']}" for it in kept]
+    lines = [(it["note"] + "\n" if it["note"] else "") + f"{_fmt(it['ts'], False, tzi, ix.has_ms)} {it['text']}" for it in kept]
     budget = cfg.ai_max_chars - len(PROMPT) - sum(len(h) + 1 for h in head) - 200
     size = sum(len(x) + 1 for x in lines)
     dropped = 0
@@ -311,8 +312,10 @@ FIELD_DOCS = {
                   "If the module regex has a sub group, that wins and this regex is only the fallback when it captured nothing",
                   "named group (?P<sub>...); for several styles use sub, sub2, sub3..."),
     "source": ("Source file, e.g. tankctrl.cpp(123)", "named group (?P<file>...); line number in (?P<line>...), optional"),
-    "time": ("UNIX time, 10 digits (seconds) or 13 digits (milliseconds). A line it does not match inherits the previous line's time",
-             "named group (?P<time>...); the captured value must be digits only"),
+    "time": ("Time. UNIX or ISO is told apart from the captured text: digits are UNIX time (10 digits seconds, 13 digits milliseconds, "
+             "decimals allowed); otherwise ISO 8601 such as 2024-01-02T10:00:00.123+09:00 (space or / also fine, offset optional; "
+             "without one, [parser] time_zone applies). Kept to the millisecond. A line it does not match inherits the previous line's time",
+             "named group (?P<time>...); capture the whole time (date, time, fraction and offset for ISO), nothing else"),
     "event": ("Event name, usually a command starting with CMD_", "named group (?P<event>...)"),
     "alarm": ("Alarm raised: each matching line counts as one alarm. If one alarm is logged over several lines "
               "(e.g. every line contains HandleAlarm), match only the line that means \"raised\", ideally the one with the code; "
