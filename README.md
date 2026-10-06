@@ -92,7 +92,7 @@ Relies only on a few anchors that can be identified reliably; everything else is
 
 - Module tags like `(TANK1)`: a line without one is treated as a continuation line of the previous one
 - Function name: `Foo()` or `CClass::Foo`, the first one in each line
-- Sub-module (optional, `[parser] submodule`): the second level under a module in the tree and swimlanes; if empty, the function name is the second level
+- Sub-module (optional): the `sub` group of `[parser] module` (same match as the module tag), else `[parser] submodule`; the second level under a module in the tree and swimlanes; if neither is set, the function name is the second level
 - `xxx.cpp`: source file
 - 10-digit UNIX seconds (13-digit milliseconds also accepted): anywhere in the line; a line without a time inherits the time from the previous line. Numbers outside 2000–2100 are not times
 - `CMD_XXX`: event name, paired into intervals per `[pairs]`; `_START`/`_END` not listed there are paired automatically; `_REQ`/`_CPL` are paired by matching name only when `[pairs]` has `CMD_*_REQ -> CMD_*_CPL`

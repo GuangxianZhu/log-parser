@@ -5,7 +5,7 @@ The anchor regexes are all in [parser] of logview.ini ([parser.<name>] for files
 only has the logic that uses them:
 - Module tag (TANK1): a line without a module tag is a continuation line of the previous record and is appended to its text
 - Function = function name (Foo() or CClass::Foo), empty if none
-- Sub-module = [parser] submodule, the second level under a module (tree, swimlane rows, module filter);
+- Sub-module = group sub of [parser] module (same match as the module), else [parser] submodule, the second level under a module (tree, swimlane rows, module filter);
   with submodule empty it is the function name, so the hierarchy is module -> function as before
 - A line with a module tag but no UNIX time: its own record, time inherited from previous line (ts_inh=1);
   a captured number outside TS_MIN..TS_MAX (e.g. a 10-digit serial number) is not a time
@@ -258,12 +258,12 @@ class Index:
                 if not line.strip():
                     continue
                 indented = line[:1].isspace()
-                module = fmt.module.get(line)
+                module, msub = fmt.module.get_both(line)  # msub: sub-module captured by the module regex itself (group sub)
                 if module is None and skipping:  # continuation line of an excluded record
                     excluded += 1
                     continue
                 if module is not None and (excl_mod or excl_sub):  # [exclude]: drop the record without parsing it further
-                    sub = (fmt.submodule.get(line) if fmt.submodule.rx is not None else fmt.function.get(line)) if excl_sub else None
+                    sub = fmt.sub_of(line, msub, None if fmt.has_sub else fmt.function.get(line)) if excl_sub else None
                     if cfg.excluded(module, sub):
                         flush(cur)
                         cur, skipping = None, True
@@ -307,13 +307,11 @@ class Index:
                 func = fmt.function.get(line)
                 if checked:
                     hit("function", func) if func else miss("no_func", module, line)
-                if fmt.submodule.rx is not None:  # the second level under the module; without submodule it is the function
-                    sub = fmt.submodule.get(line)
+                sub = fmt.sub_of(line, msub, func)  # the second level under the module; without a sub-module it is the function
+                if fmt.has_sub:
                     if checked:
                         rx[(F, "submodule")][0] += 1
                         hit("submodule", sub) if sub else miss("no_sub", module, line)
-                else:
-                    sub = func
                 sm = fmt.source.rx.search(line)
                 src = fmt.source.pick(sm) if sm else None
                 srcline = sm.group(fmt.source.line_idx) if src and fmt.source.line_idx else None
@@ -754,7 +752,10 @@ class Index:
             rows = []
             for key, fld in fmt.fields.items():
                 base, hit, nv, top = stats.get((F, key), (0, 0, 0, []))
-                rows.append({"key": key, "pattern": fld.pattern, "base": base, "hit": hit,
+                pattern = fld.pattern
+                if key == "submodule" and fmt.sub_in_module:
+                    pattern = "(group sub of the module regex)" + (", else: " + pattern if pattern else "")
+                rows.append({"key": key, "pattern": pattern, "base": base, "hit": hit,
                              "nvalues": nv, "top": top, "note": "\n".join(fmt.notes.get(key, [])),
                              "default": key in fmt.defaults})
             formats.append({"format": F, "files": fmt.files, "nfiles": nfiles.get(F, 0),

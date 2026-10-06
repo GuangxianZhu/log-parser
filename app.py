@@ -300,12 +300,15 @@ def build_ai_text(ix, f, anchor_ts=None, tz=None):
 # What each regex is for and which named groups it needs. Matches settings.FIELDS
 FIELD_DOCS = {
     "module": ("Module tag, e.g. (TANK1). A line it does not match is treated as a continuation line of the previous one, "
-               "so every new line must match", "named group (?P<module>...)"),
+               "so every new line must match. If the sub-module sits right next to the module tag, capture it here too (group sub), "
+               "so it is tied to the tag's position instead of being searched separately",
+               "named group (?P<module>...); optionally (?P<sub>...) (sub, sub2... for several styles) for the sub-module"),
     "function": ("Function name, e.g. Foo() or CClass::Foo",
                  "named group (?P<func>...); for several styles use func, func2, func3..."),
     "submodule": ("Sub-module: the second level under a module (e.g. the unit, axis or thread name the line belongs to). The tree, the per-sub-module "
                   "swimlane rows and the module filter group lines by it. May be empty: then the function name is the second level. "
-                  "Only set it if the logs have a sub-module that is more useful than the function name",
+                  "Only set it if the logs have a sub-module that is more useful than the function name. "
+                  "If the module regex has a sub group, that wins and this regex is only the fallback when it captured nothing",
                   "named group (?P<sub>...); for several styles use sub, sub2, sub3..."),
     "source": ("Source file, e.g. tankctrl.cpp(123)", "named group (?P<file>...); line number in (?P<line>...), optional"),
     "time": ("UNIX time, 10 digits (seconds) or 13 digits (milliseconds). A line it does not match inherits the previous line's time",
