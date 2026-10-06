@@ -28,7 +28,7 @@ python app.py D:\logs\20261004
 | View the log at a given moment | Click an event or empty space on the swimlanes and the list below jumps there; click a line in the list and the bottom pane shows the full text (with continuation lines) and the file line number |
 | Copy several log lines | In the log list, Ctrl+click (Cmd+click on Mac) adds or removes a line, Shift+click selects every line from the last clicked one. The bottom pane then shows "N lines selected" with "Copy" (raw lines, continuation lines included) and "Copy with file:line"; Ctrl+C on the list copies too. Up to 50,000 lines; use "Export as text" for more |
 | Filter | Module checkboxes, keyword (regex allowed), source file, only events, only alarms, only abnormal |
-| Browse by module and function | Top left is the "Modules / Functions" tree: click ▶ to expand a module and see its functions. The checkboxes decide which lines appear in the log list; you can filter by function name |
+| Browse by module and function | Top left is the "Modules / Functions" tree: click ▶ to expand a module and see its functions (its sub-modules instead, titled "Modules / Sub-modules", when `[parser] submodule` is set). The checkboxes decide which lines appear in the log list; you can filter by function name |
 | Resize | Every gray splitter can be dragged: left pane width, pane heights, swimlane height, bottom detail height. Drag the vertical line on the right of each log column header to resize the column. "Reset layout" restores the defaults |
 | Have the company AI analyze | First click an alarm trace, then "Export for AI": removes noise, folds similar lines, adds the prompt, then copy or download as .txt |
 | Find a line in the original log file | The "Log file:line" column shows which file and line each record comes from. Click a record: the panel below shows the file path (relative to the log folder) and line number, with "Copy path" / "Copy file:line" buttons |
@@ -91,6 +91,7 @@ Relies only on a few anchors that can be identified reliably; everything else is
 
 - Module tags like `(TANK1)`: a line without one is treated as a continuation line of the previous one
 - Function name: `Foo()` or `CClass::Foo`, the first one in each line
+- Sub-module (optional, `[parser] submodule`): the second level under a module in the tree and swimlanes; if empty, the function name is the second level
 - `xxx.cpp`: source file
 - 10-digit UNIX seconds (13-digit milliseconds also accepted): anywhere in the line; a line without a time inherits the time from the previous line. Numbers outside 2000–2100 are not times
 - `CMD_XXX`: event name, paired into intervals per `[pairs]`; `_START`/`_END` not listed there are paired automatically; `_REQ`/`_CPL` are paired by matching name only when `[pairs]` has `CMD_*_REQ -> CMD_*_CPL`
