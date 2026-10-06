@@ -13,7 +13,7 @@ API overview (called by index.html; the GET filter f is JSON, see logindex.Index
     GET  /api/count?f=                  number of matching lines
     GET  /api/page?f=&offset=&limit=    one page of log lines
     GET  /api/locate?f=&ts= or &id=     position of a time / line within the matching results
-    GET  /api/events?t0=&t1=&expand=    swimlane events, intervals, density (expand: JSON list of modules expanded into functions)
+    GET  /api/events?t0=&t1=&expand=    swimlane events, intervals, density (expand: JSON list of modules expanded into sub-modules)
     GET  /api/alarms                    alarm list
     GET  /api/health                    parse health check (statistics and shapes only)
     GET  /api/regexcheck?examples=1     regex check: hit rate of each regex, values captured, missed lines
@@ -94,9 +94,9 @@ class App:
     def get(self, name, qs):
         """GET /api/<name>: returns (body, Content-Type, extra response headers)."""
         one = lambda k, d=None: qs.get(k, [d])[0]  # noqa: E731
-        # drop empty filter values, but keep modules/funcs even when empty: an empty list there means "nothing selected"
+        # drop empty filter values, but keep modules/subs even when empty: an empty list there means "nothing selected"
         f = {k: v for k, v in json.loads(one("f") or "{}").items()
-             if k in ("modules", "funcs") or not (v is None or v is False or v in ("", []))}
+             if k in ("modules", "subs") or not (v is None or v is False or v in ("", []))}
         ix = self.ix
         if name == "count":
             try:
@@ -303,6 +303,10 @@ FIELD_DOCS = {
                "so every new line must match", "named group (?P<module>...)"),
     "function": ("Function name, e.g. Foo() or CClass::Foo",
                  "named group (?P<func>...); for several styles use func, func2, func3..."),
+    "submodule": ("Sub-module: the second level under a module (e.g. the unit, axis or thread name the line belongs to). The tree, the per-sub-module "
+                  "swimlane rows and the module filter group lines by it. May be empty: then the function name is the second level. "
+                  "Only set it if the logs have a sub-module that is more useful than the function name",
+                  "named group (?P<sub>...); for several styles use sub, sub2, sub3..."),
     "source": ("Source file, e.g. tankctrl.cpp(123)", "named group (?P<file>...); line number in (?P<line>...), optional"),
     "time": ("UNIX time, 10 digits (seconds) or 13 digits (milliseconds). A line it does not match inherits the previous line's time",
              "named group (?P<time>...); the captured value must be digits only"),
@@ -363,6 +367,7 @@ MISS_LIMIT = 12   # max number of missed shapes listed per kind in the pack (too
 MISS_KINDS = {"no_module": "Lines with no module found (and not an indented continuation line)",
               "no_time": "Lines with a module but no time found",
               "no_func": "Lines with a module but no function name found",
+              "no_sub": "Lines with a module but no sub-module found",
               "no_src": "Lines with a module but no source file found",
               "no_code": "Alarm-raised lines with no alarm code found (or alarm matched a line it shouldn't)"}
 

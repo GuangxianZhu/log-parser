@@ -5,6 +5,8 @@ The anchor regexes are all in [parser] of logview.ini ([parser.<name>] for files
 only has the logic that uses them:
 - Module tag (TANK1): a line without a module tag is a continuation line of the previous record and is appended to its text
 - Function = function name (Foo() or CClass::Foo), empty if none
+- Sub-module = [parser] submodule, the second level under a module (tree, swimlane rows, module filter);
+  with submodule empty it is the function name, so the hierarchy is module -> function as before
 - A line with a module tag but no UNIX time: its own record, time inherited from previous line (ts_inh=1);
   a captured number outside TS_MIN..TS_MAX (e.g. a 10-digit serial number) is not a time
 - CMD_xxx: event; HandleAlarm: alarm raised, RESET: cleared, matched by the alarmindex code
@@ -32,7 +34,7 @@ import sqlite3
 import time
 from collections import Counter, defaultdict
 
-SCHEMA_VERSION = "minimal-7"   # bump when the table layout or stored labels change; old caches are then invalidated
+SCHEMA_VERSION = "minimal-8"   # bump when the table layout or stored labels change; old caches are then invalidated
 
 LEVEL_WINDOW = 20   # when the alarm level comes after the alarm, how many records of the same module to look ahead
 # A captured time outside this range is not a real time (e.g. a serial number 0000000001 or 9999999999 that happens to be 10 digits);
@@ -100,9 +102,9 @@ def _regexp(pattern, value):
 
 
 # columns of table lines (during parsing each record is a list like this)
-COLS = ("ts", "ts_inh", "module", "func", "src", "srcline", "file_id", "lineno", "event", "level",
+COLS = ("ts", "ts_inh", "module", "sub", "func", "src", "srcline", "file_id", "lineno", "event", "level",
         "alarm", "alarm_state", "color", "text")
-TS, TS_INH, MODULE, FUNC, SRC, SRCLINE, FILE_ID, LINENO, EVENT, LEVEL, ALARM, ALARM_STATE, COLOR, TEXT = range(14)
+TS, TS_INH, MODULE, SUB, FUNC, SRC, SRCLINE, FILE_ID, LINENO, EVENT, LEVEL, ALARM, ALARM_STATE, COLOR, TEXT = range(15)
 INSERT = "INSERT INTO raw VALUES(%s)" % ",".join("?" * len(COLS))
 
 
@@ -160,7 +162,7 @@ class Index:
             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, size INT, lines INT,
                                records INT, encodings TEXT, decode_errors INT, no_time_at_start INT,
                                format TEXT);
-            CREATE TABLE raw(ts INT, ts_inh INT, module TEXT, func TEXT, src TEXT, srcline INT,
+            CREATE TABLE raw(ts INT, ts_inh INT, module TEXT, sub TEXT, func TEXT, src TEXT, srcline INT,
                              file_id INT, lineno INT, event TEXT, level TEXT,
                              alarm TEXT, alarm_state TEXT, color TEXT, text TEXT);
             CREATE TABLE shapes(kind TEXT, format TEXT, module TEXT, shape TEXT, n INT, example TEXT);
@@ -188,7 +190,7 @@ class Index:
             CREATE TABLE lines AS SELECT * FROM raw ORDER BY ts, file_id, lineno;
             DROP TABLE raw;
             CREATE INDEX ix_ts ON lines(ts);
-            CREATE INDEX ix_mod ON lines(module, func, ts);
+            CREATE INDEX ix_mod ON lines(module, sub, ts);
             CREATE INDEX ix_ev ON lines(level, ts);
         """)
         self._resolve_names(db)
@@ -292,6 +294,13 @@ class Index:
                 func = fmt.function.get(line)
                 if checked:
                     hit("function", func) if func else miss("no_func", module, line)
+                if fmt.submodule.rx is not None:  # the second level under the module; without submodule it is the function
+                    sub = fmt.submodule.get(line)
+                    if checked:
+                        rx[(F, "submodule")][0] += 1
+                        hit("submodule", sub) if sub else miss("no_sub", module, line)
+                else:
+                    sub = func
                 sm = fmt.source.rx.search(line)
                 src = fmt.source.pick(sm) if sm else None
                 srcline = sm.group(fmt.source.line_idx) if src and fmt.source.line_idx else None
@@ -373,7 +382,7 @@ class Index:
                             del wait[module]
 
                 flush(cur)
-                cur = [ts, ts_inh, module, func, src, srcline, fid, lineno, event, level,
+                cur = [ts, ts_inh, module, sub, func, src, srcline, fid, lineno, event, level,
                        alarm, alarm_state, color, line]
                 nrec += 1
                 if ts is None:
@@ -426,10 +435,10 @@ class Index:
     def _build_intervals(self, db):
         """Pair intervals: command pairs from [pairs] (including same-name pairs like CMD_*_REQ -> CMD_*_CPL), unlisted
         XXX_START/XXX_END, and alarm to RESET. An interval belongs to the module where it starts; if start and end are in the
-        same function, func is that function ("" for no function name, also drawn on the swimlane function rows);
-        across functions func is NULL and it is drawn only on the module row."""
+        same sub-module (the function when [parser] submodule is empty), sub is that one ("" for none, also drawn on its swimlane row);
+        across sub-modules sub is NULL and it is drawn only on the module row."""
         pairs = self.cfg.pairs
-        db.execute("""CREATE TABLE intervals(module TEXT, func TEXT, name TEXT, kind TEXT,
+        db.execute("""CREATE TABLE intervals(module TEXT, sub TEXT, name TEXT, kind TEXT,
                       t0 INT, t1 INT, end_event TEXT, closed INT)""")
         open_ = {}   # (module or *, name) -> (start time, start module, start function)
         out = []
@@ -448,7 +457,7 @@ class Index:
 
         use_done = self.cfg.use_done
         for ts, module, func, event, alarm, state in db.execute(
-                "SELECT ts, module, func, event, alarm, alarm_state FROM lines WHERE level IS NOT NULL ORDER BY rowid"):
+                "SELECT ts, module, sub, event, alarm, alarm_state FROM lines WHERE level IS NOT NULL ORDER BY rowid"):
             last_ts = ts
             if alarm:  # alarm raised to cleared: the thin red band at the top of the swimlanes. With alarm_done set, the RESET action does not end it
                 k = (self._alarm_key(module), "ALARM " + alarm)
@@ -518,30 +527,31 @@ class Index:
             "trace_before": self.cfg.trace_before, "trace_after": self.cfg.trace_after,
             "alarm_table": self.alarm_table, "alarm_names": self.alarm_names,
             "config": self.cfg.path, "use_done": self.cfg.use_done, "warnings": self.cfg.warnings,
+            "has_sub": self.cfg.has_sub,
             "tree": self.tree(),
         }
 
     def tree(self):
-        """The module -> function tree on the left: {module: [[function, lines], ...]}, functions by line count, most first. No function name is ""."""
+        """The module -> sub-module tree on the left: {module: [[sub-module, lines], ...]}, by line count, most first. None is ""."""
         out = defaultdict(list)
-        for mod, func, n in self.db.execute(
-                "SELECT module, IFNULL(func, ''), COUNT(*) FROM lines GROUP BY 1, 2 ORDER BY 1, 3 DESC"):
-            out[mod].append([func, n])
+        for mod, sub, n in self.db.execute(
+                "SELECT module, IFNULL(sub, ''), COUNT(*) FROM lines GROUP BY 1, 2 ORDER BY 1, 3 DESC"):
+            out[mod].append([sub, n])
         return dict(out)
 
     def _where(self, f):
         """Filter f (dict from the web page) -> SQL WHERE."""
         conds, args = [], []
-        if "modules" in f or "funcs" in f:
-            # modules: whole modules; funcs: [[module, function], ...] only these functions (function "" = lines without a function name)
-            mods, funcs = f.get("modules") or [], f.get("funcs") or []
+        if "modules" in f or "subs" in f:
+            # modules: whole modules; subs: [[module, sub-module], ...] only these sub-modules ("" = lines without one)
+            mods, subs = f.get("modules") or [], f.get("subs") or []
             parts = []
             if mods:
                 parts.append("module IN (%s)" % ",".join("?" * len(mods)))
                 args += mods
-            if funcs:
-                parts.append("module || char(1) || IFNULL(func, '') IN (%s)" % ",".join("?" * len(funcs)))
-                args += [m + "\x01" + fn for m, fn in funcs]
+            if subs:
+                parts.append("module || char(1) || IFNULL(sub, '') IN (%s)" % ",".join("?" * len(subs)))
+                args += [m + "\x01" + sb for m, sb in subs]
             conds.append("(" + (" OR ".join(parts) or "0") + ")")
         if f.get("t0") is not None:
             conds.append("ts >= ?")
@@ -587,7 +597,7 @@ class Index:
             hit = self._filter_cache[key] = (ids, tss)
         return hit
 
-    def fetch(self, ids, cols="rowid, ts, ts_inh, module, func, src, srcline, file_id, lineno, event, level, "
+    def fetch(self, ids, cols="rowid, ts, ts_inh, module, sub, func, src, srcline, file_id, lineno, event, level, "
                                "alarm, alarm_state, color, text"):
         """Fetch records by rowid (in batches, to avoid too many SQL parameters)."""
         out = []
@@ -619,17 +629,17 @@ class Index:
 
     def events(self, t0, t1, expand=(), limit=EVENT_LIMIT):
         """What the swimlanes need: event points, intervals, log density per module.
-        expand: modules expanded in the swimlanes; their density is also counted per (module, function), keyed "module\x01function" (no function name is "").
+        expand: modules expanded in the swimlanes; their density is also counted per (module, sub-module), keyed "module\x01sub" (none is "").
         More than limit events in the range: alarms, clears and abnormal lines are all kept, plain events are thinned out evenly
         over the whole range (every k-th one), so the right side of the swimlanes doesn't go blank; truncated tells the page."""
         t0, t1 = int(t0), int(t1)
-        sql = ("SELECT rowid, ts, module, func, event, level, alarm, alarm_state, color FROM lines "
+        sql = ("SELECT rowid, ts, module, sub, event, level, alarm, alarm_state, color FROM lines "
                "WHERE level IS NOT NULL AND ts BETWEEN ? AND ?")
         n = self.db.execute("SELECT COUNT(*) FROM lines WHERE level IS NOT NULL AND ts BETWEEN ? AND ?", (t0, t1)).fetchone()[0]
         k = -(-n // int(limit))  # keep every k-th plain event
         rows = self.db.execute(sql + (f" AND (level != 'event' OR rowid % {k} = 0)" if k > 1 else "") + " ORDER BY rowid",
                                (t0, t1)).fetchall()
-        ivs = self.db.execute("SELECT module, func, name, kind, t0, t1, end_event, closed FROM intervals "
+        ivs = self.db.execute("SELECT module, sub, name, kind, t0, t1, end_event, closed FROM intervals "
                               "WHERE t1 >= ? AND t0 <= ?", (t0, t1)).fetchall()
         buckets = 200
         width = max(1, (t1 - t0 + buckets - 1) // buckets)
@@ -641,17 +651,17 @@ class Index:
                 counts[mod][b] = n
         expand = [m for m in expand if m in self.modules]
         if expand:
-            for mod, func, b, n in self.db.execute(
-                    "SELECT module, IFNULL(func, ''), (ts - ?) / ?, COUNT(*) FROM lines "
+            for mod, sub, b, n in self.db.execute(
+                    "SELECT module, IFNULL(sub, ''), (ts - ?) / ?, COUNT(*) FROM lines "
                     f"WHERE ts BETWEEN ? AND ? AND module IN ({','.join('?' * len(expand))}) GROUP BY 1, 2, 3",
                     (t0, width, t0, t1, *expand)):
                 if 0 <= b < buckets:
-                    counts[mod + "\x01" + func][b] = n
+                    counts[mod + "\x01" + sub][b] = n
         return {
-            "events": [dict(zip(("id", "ts", "module", "func", "event", "level", "alarm", "alarm_state", "color"), r))
+            "events": [dict(zip(("id", "ts", "module", "sub", "event", "level", "alarm", "alarm_state", "color"), r))
                        for r in rows],
             "truncated": k > 1,
-            "intervals": [dict(zip(("module", "func", "name", "kind", "t0", "t1", "end_event", "closed"), r))
+            "intervals": [dict(zip(("module", "sub", "name", "kind", "t0", "t1", "end_event", "closed"), r))
                           for r in ivs],
             "density": {"t0": t0, "width": width, "counts": dict(counts)},
         }
@@ -667,8 +677,8 @@ class Index:
         use_done, check = self.cfg.use_done, self.cfg.reset_check
         levels = {(f, n): v for f, n, v in self.db.execute("SELECT file_id, lineno, level FROM alarm_levels")}
         out, open_, last_done = [], {}, {}  # last_done: the alarms cleared most recently for each (module, code)
-        for rid, ts, module, func, alarm, event, level, state, fid, lineno in self.db.execute(
-                "SELECT rowid, ts, module, func, alarm, event, level, alarm_state, file_id, lineno FROM lines "
+        for rid, ts, module, sub, func, alarm, event, level, state, fid, lineno in self.db.execute(
+                "SELECT rowid, ts, module, sub, func, alarm, event, level, alarm_state, file_id, lineno FROM lines "
                 "WHERE level IN ('alarm', 'clear') ORDER BY rowid"):
             k = (self._alarm_key(module), alarm)
             if level == "clear":
@@ -687,7 +697,7 @@ class Index:
                 for p in last_done.pop(k, ()):
                     if ts - p["reset_ts"] <= check:
                         p["reraise_ts"], p["reraise_id"] = ts, rid
-            a = {"id": rid, "ts": ts, "module": module, "func": func, "alarm": alarm, "event": event,
+            a = {"id": rid, "ts": ts, "module": module, "sub": sub, "func": func, "alarm": alarm, "event": event,
                  "name": self.alarm_names.get(alarm), "level": levels.get((fid, lineno)),
                  "reset_ts": None, "reset_id": None, "reset_req_ts": None, "reset_req_id": None,
                  "reraise_ts": None, "reraise_id": None}

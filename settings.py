@@ -44,6 +44,9 @@ files = *.log, *.txt
 module = \((?P<module>[A-Z]{2,}\d*)\)
 ; Function name, group func. If there are several styles, use func, func2, func3...; the first one found wins
 function = \b(?P<func>[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)|\b(?P<func2>[A-Za-z_]\w*)\(\)
+; Sub-module (may be empty), group sub; several styles: sub, sub2, sub3... The second level under a module: the tree on the left,
+;   the per-sub-module swimlane rows and the module filter use it. Empty = the function name is the second level
+submodule =
 ; Source file, group file; line number in group line (optional)
 source = (?P<file>[\w\-]+\.(?:cpp|cc|c|hpp|h))(?:\((?P<line>\d+)\))?
 ; UNIX time, group time: 10 digits (seconds) or 13 digits (milliseconds). A line without a time inherits the previous line's
@@ -162,6 +165,7 @@ def note_digest(note):
 FIELDS = {
     "module": "module",
     "function": "func",
+    "submodule": "sub",
     "source": "file",      # may also have group line (line number)
     "time": "time",
     "event": "event",
@@ -173,7 +177,7 @@ FIELDS = {
     "alarm_level": "level",
     "abnormal": "what",    # without a group, the whole matched text is used
 }
-OPTIONAL = {"alarm_done", "alarm_name", "alarm_level", "abnormal"}   # may be empty; empty = not used
+OPTIONAL = {"submodule", "alarm_done", "alarm_name", "alarm_level", "abnormal"}   # may be empty; empty = not used
 ALT = {"source": "line", "alarm_code": "name", "alarm_name": "code"}  # second value that can be extracted besides the main one
 
 
@@ -285,6 +289,11 @@ class Config:
     @property
     def default(self):
         return self.formats[-1]
+
+    @property
+    def has_sub(self):
+        """submodule is set (in [parser] or a [parser.<name>]): the second level under a module is the sub-module, else the function."""
+        return any(f.submodule.rx is not None for f in self.formats)
 
     @property
     def use_done(self):
