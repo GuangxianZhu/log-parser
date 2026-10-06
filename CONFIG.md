@@ -59,6 +59,18 @@ module = <(?P<module>[A-Z]{2,}\d*)>
 - For each file, the first section in ini order whose `files` matches is used; if none matches, `[parser]` is used.
 - The check tab shows each section separately, and the "By file" table has a column showing which section each file uses.
 
+### [exclude] Modules left out
+
+With many modules (70+), leave out the ones you never look at. Their lines, and the continuation lines under them, are dropped while parsing:
+they appear nowhere (tree, swimlanes, log list, alarms, intervals, regex check, exports), and parsing is faster. Click "Re-parse" after changing.
+
+| Entry | Default | Notes |
+|---|---|---|
+| `modules` | Empty | Module names, comma-separated; `*` and `?` wildcards, case-insensitive. E.g. `IOMON, SIM*, TANK9?` |
+| `submodules` | Empty | `module/sub-module`, e.g. `TANK*/PUMP, */DEBUG*`. Without a `/` it applies to any module (`DEBUG*` = `*/DEBUG*`). The sub-module is what `[parser] submodule` captures, or the function name when that is empty |
+
+The status bar shows how many lines were left out; the "By file" counts on the Regex check tab count only the lines kept.
+
 ### [view] Alarm trace
 
 | Entry | Default | Notes |

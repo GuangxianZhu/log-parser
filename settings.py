@@ -83,6 +83,16 @@ reset_check = 60
 ; files = sys_*.log
 ; time = \[(?P<time>\d{10})\]
 
+[exclude]
+; Modules / sub-modules left out completely: their lines (and continuation lines) are dropped while parsing, so they
+; appear nowhere (tree, swimlanes, list, alarms, regex check). Comma-separated, * and ? wildcards, case-insensitive.
+; After changing, click "Re-parse".
+; Modules, e.g. IOMON, SIM*, TANK9?
+modules =
+; Sub-modules (the second level under a module: [parser] submodule, or the function name if that is empty),
+; as module/sub-module, e.g. TANK*/PUMP, */DEBUG*; without a / it applies to any module (DEBUG* = */DEBUG*)
+submodules =
+
 [view]
 ; Default seconds before and after an alarm when tracing it
 trace_before = 600
@@ -213,6 +223,11 @@ class Pair:
         return None
 
 
+def _wild_i(pat):
+    """[exclude] wildcard (* any run, ? one character) -> case-insensitive regex for fullmatch."""
+    return re.compile("".join(".*" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pat.strip()), re.I)
+
+
 def _wild(pat):
     """Command wildcard -> regex; * becomes a group so the matched part can be taken out."""
     return re.compile("".join("(.*)" if ch == "*" else "." if ch == "?" else re.escape(ch) for ch in pat))
@@ -280,6 +295,8 @@ class Config:
     ai_noise: re.Pattern = None
     ai_fold: bool = True
     module_names: dict = field(default_factory=dict)
+    exclude_modules: list = field(default_factory=list)      # [exclude] modules: compiled wildcards
+    exclude_subs: list = field(default_factory=list)         # [exclude] submodules: (module wildcard, sub-module wildcard)
     pairs: list = field(default_factory=list)
     rules: list = field(default_factory=list)
     warnings: list = field(default_factory=list)  # keys in the user's file that the tool does not know (typos), shown on the page
@@ -289,6 +306,12 @@ class Config:
     @property
     def default(self):
         return self.formats[-1]
+
+    def excluded(self, module, sub=None):
+        """[exclude]: is this module (or this sub-module of it) left out? sub None = check the module only."""
+        if any(rx.fullmatch(module) for rx in self.exclude_modules):
+            return True
+        return sub is not None and any(m.fullmatch(module) and s.fullmatch(sub) for m, s in self.exclude_subs)
 
     @property
     def has_sub(self):
@@ -494,13 +517,16 @@ def load(user_dir=None):
         ai_noise=_compile(noise, "[ai] noise") if noise else None,
         ai_fold=_yes(get("ai", "fold")),
         module_names=dict((user if user.has_section("modules") else base)["modules"].items()),
+        exclude_modules=[_wild_i(p) for p in _split(get("exclude", "modules"))],
+        exclude_subs=[(_wild_i(p.split("/", 1)[0]), _wild_i(p.split("/", 1)[1])) if "/" in p else (_wild_i("*"), _wild_i(p))
+                      for p in _split(get("exclude", "submodules"))],
         path=path,
         digest=hashlib.sha1(text.encode("utf-8")).hexdigest(),
     )
 
     # keys the tool doesn't know are ignored, so a typo (alarm_codes =, Module =) would silently fall back to the default: list them
     known = {"parser": set(FIELDS) | {"encodings", "files", "reset_same_module", "reset_check"},
-             "view": {"trace_before", "trace_after", "alarm_table"}, "ai": {"max_chars", "noise", "fold"}}
+             "view": {"trace_before", "trace_after", "alarm_table"}, "exclude": {"modules", "submodules"}, "ai": {"max_chars", "noise", "fold"}}
     known["parser."] = known["parser"] - {"reset_same_module", "reset_check"}
     for s in user.sections():
         keys = known.get("parser." if s.startswith("parser.") else s)

@@ -401,7 +401,7 @@ async function pollStatus() {
   if (s.state === "error") { setStatus("Error: " + s.msg, true); return; }
   if (s.state !== "ready") return;
   const sm = s.summary;
-  setStatus(`${sm.files} files · ${sm.total.toLocaleString()} records · ${s.msg}` +
+  setStatus(`${sm.files} files · ${sm.total.toLocaleString()} records${sm.excluded ? ` (${sm.excluded.toLocaleString()} lines excluded by [exclude])` : ""} · ${s.msg}` +
     (sm.warnings.length ? ` · ${sm.warnings.length} config warning(s), see Regex check` : ""), sm.warnings.length > 0);
   if (!S.summary || S.summary.folder !== sm.folder || S.summary.total !== sm.total || s.rebuilt) onLoaded(sm);
 }
