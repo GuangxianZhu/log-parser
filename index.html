@@ -285,7 +285,7 @@ function setTz(tz) {  // returns false if the browser doesn't know the time zone
 }
 function tzParts(ts, fmt = tzFmt) {  // UNIX seconds -> wall clock {y, mo (1-12), d, h, mi, s} in S.tz
   const p = {};
-  for (const x of fmt.formatToParts(new Date(ts * 1000))) p[x.type] = +x.value;
+  for (const x of fmt.formatToParts(new Date(Math.round(ts * 1000)))) p[x.type] = +x.value;
   return { y: p.year, mo: p.month, d: p.day, h: p.hour % 24, mi: p.minute, s: p.second };
 }
 const tzOffset = (ts, fmt = tzFmt) => {  // seconds east of UTC
@@ -305,10 +305,11 @@ function tzLabel(tz = S.tz) {
   const t = tz || LOCAL_TZ, off = tzOffset(Date.now() / 1000, makeTzFmt(tz)), a = Math.abs(off) / 60;
   return `${t} (UTC${off < 0 ? "-" : "+"}${pad(Math.floor(a / 60))}:${pad(a % 60)})`;
 }
-function fmtTs(ts, withDate = true) {
+const hasMs = () => !!(S.summary && S.summary.has_ms);  // some log times carry milliseconds (ISO .123 or 13-digit UNIX)
+function fmtTs(ts, withDate = true, ms = hasMs()) {
   if (!ts) return "--";
   const d = tzParts(ts);
-  const hms = `${pad(d.h)}:${pad(d.mi)}:${pad(d.s)}`;
+  const hms = `${pad(d.h)}:${pad(d.mi)}:${pad(d.s)}` + (ms ? "." + String(((Math.round(ts * 1000) % 1000) + 1000) % 1000).padStart(3, "0") : "");
   return withDate ? `${pad(d.mo)}-${pad(d.d)} ${hms}` : hms;
 }
 const fmtFull = (ts) => `${tzParts(ts).y}-${fmtTs(ts)}`;
@@ -322,7 +323,8 @@ const withName = (code) => code && alarmName(code) ? `${code} ${alarmName(code)}
 const LV_COLORS = ["#7c3aed", "#0891b2", "#b45309", "#be185d", "#4d7c0f", "#475569"];
 const lvColor = (lv) => LV_COLORS[(S.levels || []).indexOf(lv) % LV_COLORS.length] || "#475569";
 function fmtDur(s) {
-  if (s < 60) return `${s} s`;
+  if (s < 60) return `${Math.round(s * 1000) / 1000} s`;
+  s = Math.round(s);
   if (s < 3600) return `${Math.floor(s / 60)} min ${s % 60} s`;
   return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
 }
@@ -411,6 +413,7 @@ async function pollStatus() {
 }
 function onLoaded(sm) {
   S.summary = sm;
+  if (sm.has_ms && colW[0] < 160) { colW[0] = 160; applyCols(); }  // room for .mmm in the time column
   $("folder").value = sm.folder;
   S.modules = sm.modules; S.tree = sm.tree;
   $("treeTitle").textContent = sm.has_sub ? "Modules / Sub-modules" : "Modules / Functions";
@@ -811,7 +814,7 @@ async function jumpToId(id) {
   const r = (await getPage(Math.floor(pos / PAGE))).find((x) => x.id === id);
   if (r) selectRow(r);
 }
-async function jumpToTs(ts) { scrollToIndex((await api("locate", { f: S.f, ts: Math.floor(ts) })).pos); }
+async function jumpToTs(ts) { scrollToIndex((await api("locate", { f: S.f, ts })).pos); }
 
 // ===== Swimlanes: one row per module. ▲ alarm, ○ cleared, vertical line event, colored block interval, thin red band at top alarm duration, grey bar at bottom log density =====
 // A module can be expanded (click ▶ in the tree on the left, or the module name left of the swimlanes): the module row keeps the summary of
@@ -863,23 +866,24 @@ const lanes = {
     const cv = this.cv, c = cv.getContext("2d"), W = cv.clientWidth, H = cv.clientHeight, span = S.view.t1 - S.view.t0;
     c.clearRect(0, 0, W, H);
     // time axis, background of the trace range
-    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 345600, 604800, 1209600, 2419200];
+    const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 345600, 604800, 1209600, 2419200];
     const want = span / Math.max(1, (W - LEFT) / 120);
     const step = steps.find((s) => s >= want) || Math.ceil(want / 86400) * 86400;  // at least ~120 px between labels (hh:mm:ss with a date fits)
     // minor ticks: the largest smaller step that divides the major step into 2..7 parts
-    const minor = steps.filter((s) => s < step && step % s === 0 && step / s <= 7).pop() || 0;
+    const divides = (a, b) => Math.abs(a / b - Math.round(a / b)) < 1e-9;  // steps below 1 s are not exact in floating point
+    const minor = steps.filter((s) => s < step && divides(step, s) && step / s <= 7).pop() || 0;
     // tick times on whole seconds/minutes/hours/midnight of the selected time zone (re-aligned per tick at hour steps, so DST stays on the hour)
     const ticksOf = (st) => {
       const out = [];
       let prev = -Infinity, o0 = tzOffset(S.view.t0);
-      for (let tk = Math.ceil((S.view.t0 + o0) / st) * st - o0; tk <= S.view.t1 && out.length < 2000; tk += st) {
+      for (let i = Math.ceil((S.view.t0 + o0) / st), tk = i * st - o0; tk <= S.view.t1 && out.length < 2000; tk = ++i * st - o0) {
         if (st >= 3600) { const o = tzOffset(tk), t = Math.round((tk + o) / st) * st - o; if (t > prev) tk = t; }
         prev = tk;
         if (xOf(cv, tk) >= LEFT) out.push(tk);
       }
       return out;
     };
-    const majors = ticksOf(step), majorSet = new Set(majors), minors = minor ? ticksOf(minor).filter((t) => !majorSet.has(t)) : [];
+    const majors = ticksOf(step), majorSet = new Set(majors.map((t) => Math.round(t * 1000))), minors = minor ? ticksOf(minor).filter((t) => !majorSet.has(Math.round(t * 1000))) : [];
     // axis: baseline, minor ticks, major ticks with labels centred on them.
     // Label: always hh:mm:ss, with the date on the first tick and wherever the day changes (MM-DD only for steps of a day or more)
     c.font = FONT;
@@ -893,7 +897,7 @@ const lanes = {
     let prevDay = null;
     for (const tk of majors) {
       const x = xOf(cv, tk), p = tzParts(tk), day = `${pad(p.mo)}-${pad(p.d)}`;
-      const hm = `${pad(p.h)}:${pad(p.mi)}:${pad(p.s)}`;
+      const hm = step < 1 ? fmtTs(tk, false, true) : `${pad(p.h)}:${pad(p.mi)}:${pad(p.s)}`;  // below 1 s: hh:mm:ss.mmm
       const showDay = step >= 86400 || day !== prevDay;
       const lbl = step >= 86400 ? day : showDay ? `${day} ${hm}` : hm, w = c.measureText(lbl).width;
       c.fillStyle = showDay ? "#111827" : "#374151";
@@ -1006,7 +1010,7 @@ const lanes = {
       c.beginPath(); c.moveTo(x, AXIS_H - 6); c.lineTo(x, H); c.stroke(); c.setLineDash([]);
     }
     if (this.hoverX != null && this.hoverX > LEFT && !this.drag) {  // mouse position: guide line + exact time on the axis, at any zoom
-      const t = tOf(cv, this.hoverX), lbl = fmtTs(Math.floor(t)), tw = c.measureText(lbl).width + 8;
+      const t = tOf(cv, this.hoverX), lbl = fmtTs(hasMs() ? t : Math.floor(t)), tw = c.measureText(lbl).width + 8;
       const lx = Math.min(Math.max(this.hoverX - tw / 2, LEFT), W - tw);
       c.strokeStyle = "rgba(17,24,39,0.35)"; c.beginPath(); c.moveTo(this.hoverX, AXIS_H); c.lineTo(this.hoverX, H); c.stroke();
       c.fillStyle = "#111827"; c.fillRect(lx, 0, tw, 16);
@@ -1043,9 +1047,9 @@ const lanes = {
   cv.addEventListener("wheel", (e) => {
     e.preventDefault();
     const tc = tOf(cv, e.offsetX), span = S.view.t1 - S.view.t0;
-    // zoom in down to 10 s; zoom out at most to the whole log plus half of it again (further out is empty)
+    // zoom in down to 10 s (1 s when the logs have milliseconds); zoom out at most to the whole log plus half of it again (further out is empty)
     const maxSpan = S.summary ? Math.max(60, (S.summary.t_max - S.summary.t_min) * 1.5) : 86400;
-    const k = Math.min(Math.max(e.deltaY > 0 ? 1.25 : 0.8, 10 / span), maxSpan / span);
+    const k = Math.min(Math.max(e.deltaY > 0 ? 1.25 : 0.8, (hasMs() ? 1 : 10) / span), maxSpan / span);
     if (Math.abs(k - 1) < 1e-6) return;
     S.view = { t0: tc - (tc - S.view.t0) * k, t1: tc + (S.view.t1 - tc) * k }; lanes.draw(); viewChanged();
   }, { passive: false });

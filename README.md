@@ -94,7 +94,7 @@ Relies only on a few anchors that can be identified reliably; everything else is
 - Function name: `Foo()` or `CClass::Foo`, the first one in each line
 - Sub-module (optional): the `sub` group of `[parser] module` (same match as the module tag), else `[parser] submodule`; the second level under a module in the tree and swimlanes; if neither is set, the function name is the second level
 - `xxx.cpp`: source file
-- 10-digit UNIX seconds (13-digit milliseconds also accepted): anywhere in the line; a line without a time inherits the time from the previous line. Numbers outside 2000–2100 are not times
+- Time: UNIX (10-digit seconds, 13-digit milliseconds) or ISO 8601 (`2024-01-02 10:00:00.123`, `2024-01-02T10:00:00.123+09:00`), told apart automatically, kept to the millisecond (shown as hh:mm:ss.mmm when the logs have milliseconds). ISO without an offset uses `[parser] time_zone` (empty = this computer's time zone). A line without a time inherits the time from the previous line. Numbers outside 2000–2100 are not times
 - `CMD_XXX`: event name, paired into intervals per `[pairs]`; `_START`/`_END` not listed there are paired automatically; `_REQ`/`_CPL` are paired by matching name only when `[pairs]` has `CMD_*_REQ -> CMD_*_CPL`
 - Alarms: a line with `HandleAlarm` is an alarm raised, a line with `RESET` is a clear (`HandleAlarm RESET` and `ResetAlarm` both count), matched by the `alarmindex: XXXX` code; by default they must also be in the same module. With `alarm_done` set, RESET counts only as an action and only reset done counts as cleared; alarms raised again soon after clearing are marked red
 - Alarm names and levels (optional): `alarm_name` learns the code-to-name mapping; an `alarm_level` level is assigned to the nearest alarm in the same module

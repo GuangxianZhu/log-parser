@@ -7,7 +7,9 @@ only has the logic that uses them:
 - Function = function name (Foo() or CClass::Foo), empty if none
 - Sub-module = group sub of [parser] module (same match as the module), else [parser] submodule, the second level under a module (tree, swimlane rows, module filter);
   with submodule empty it is the function name, so the hierarchy is module -> function as before
-- A line with a module tag but no UNIX time: its own record, time inherited from previous line (ts_inh=1);
+- Time: UNIX (seconds / milliseconds / with decimals) or ISO 8601 (2024-01-02T10:00:00.123+09:00, also with a space or /),
+  told apart automatically from what [parser] time captured; kept as seconds with milliseconds (ts is REAL).
+  A line with a module tag but no time: its own record, time inherited from previous line (ts_inh=1);
   a captured number outside TS_MIN..TS_MAX (e.g. a 10-digit serial number) is not a time
 - CMD_xxx: event; HandleAlarm: alarm raised, RESET: cleared, matched by the alarmindex code
 - Alarm name: lines with both code and name build the alarm_names table; alarm lines with only the name are mapped back to the code before pairing
@@ -34,13 +36,52 @@ import re
 import sqlite3
 import time
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
 
-SCHEMA_VERSION = "minimal-9"   # bump when the table layout or stored labels change; old caches are then invalidated
+SCHEMA_VERSION = "minimal-10"   # bump when the table layout or stored labels change; old caches are then invalidated
 
 LEVEL_WINDOW = 20   # when the alarm level comes after the alarm, how many records of the same module to look ahead
 # A captured time outside this range is not a real time (e.g. a serial number 0000000001 or 9999999999 that happens to be 10 digits);
 # the line inherits the previous time instead, so one stray number can't stretch the timeline back to 1970
 TS_MIN, TS_MAX = 946684800, 4102444800   # 2000-01-01 .. 2100-01-01
+_ISO = re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T ]+|\s+)(\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?"
+                  r"\s*(Z|UTC|[+-]\d{2}(?::?\d{2})?)?", re.I)
+
+
+def parse_time(s, tz=None):
+    """Captured time text -> UNIX seconds (int, or float with milliseconds), None if it is not a time.
+    Told apart automatically: digits are UNIX time (seconds; above 1e11 milliseconds, above 1e14 microseconds; decimals allowed),
+    anything else ISO 8601. ISO without an offset is in tz ([parser] time_zone; None = this computer's local time)."""
+    s = (s or "").strip()
+    try:
+        if s.replace(".", "", 1).isdigit():
+            v = float(s) if "." in s else int(s)
+            v = v / 1_000_000 if v > 1e14 else v / 1000 if v > 1e11 else v
+        else:
+            m = _ISO.match(s)
+            if not m:
+                return None
+            y, mo, d, h, mi, sec, frac, off = m.groups()
+            us = int((frac or "0")[:6].ljust(6, "0"))
+            if off:
+                off = off.upper()
+                if off in ("Z", "UTC"):
+                    zone = timezone.utc
+                else:
+                    hh, mm = off[1:3], off[3:].lstrip(":") or "0"
+                    zone = timezone((-1 if off[0] == "-" else 1) * timedelta(hours=int(hh), minutes=int(mm)))
+            else:
+                zone = tz
+            dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec or 0), us, zone)
+            v = dt.timestamp()  # naive (zone None) = local time of this computer
+    except (ValueError, OverflowError, OSError):
+        return None
+    if not TS_MIN <= v < TS_MAX:
+        return None
+    v = round(v, 3)
+    return int(v) if v == int(v) else v
+
+
 EVENT_LIMIT = 20000  # max event points sent to the swimlanes at once; beyond that, plain events are thinned out evenly
 
 _shape_alpha = re.compile(r"[A-Za-z]+")
@@ -163,7 +204,7 @@ class Index:
             CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT, size INT, lines INT,
                                records INT, excluded INT, encodings TEXT, decode_errors INT, no_time_at_start INT,
                                format TEXT);
-            CREATE TABLE raw(ts INT, ts_inh INT, module TEXT, sub TEXT, func TEXT, src TEXT, srcline INT,
+            CREATE TABLE raw(ts REAL, ts_inh INT, module TEXT, sub TEXT, func TEXT, src TEXT, srcline INT,
                              file_id INT, lineno INT, event TEXT, level TEXT,
                              alarm TEXT, alarm_state TEXT, color TEXT, text TEXT);
             CREATE TABLE shapes(kind TEXT, format TEXT, module TEXT, shape TEXT, n INT, example TEXT);
@@ -289,10 +330,8 @@ class Index:
 
                 ts, ts_inh = None, 0
                 for m in fmt.time.rx.finditer(line):  # the first plausible time on the line (skips e.g. a 10-digit serial number before it)
-                    tv = fmt.time.pick(m)
-                    v = int(tv) if tv and tv.isdigit() else 0
-                    v = v // 1000 if v > 10_000_000_000 else v
-                    if TS_MIN <= v < TS_MAX:
+                    v = parse_time(fmt.time.pick(m), fmt.tz)
+                    if v is not None:
                         ts = v
                         break
                 if ts is not None:
@@ -514,6 +553,7 @@ class Index:
         self.modules = [r[0] for r in self.db.execute("SELECT DISTINCT module FROM lines ORDER BY module")]
         r = self.db.execute("SELECT MIN(ts), MAX(ts) FROM lines WHERE ts > 0").fetchone()
         self.t_min, self.t_max = r if r[0] is not None else (0, 0)
+        self.has_ms = self.db.execute("SELECT 1 FROM lines WHERE ts != CAST(ts AS INT) LIMIT 1").fetchone() is not None
         self.alarm_names = dict(self.db.execute("SELECT code, name FROM alarm_names"))
         self._load_alarm_table()
 
@@ -539,7 +579,7 @@ class Index:
             "trace_before": self.cfg.trace_before, "trace_after": self.cfg.trace_after,
             "alarm_table": self.alarm_table, "alarm_names": self.alarm_names,
             "config": self.cfg.path, "use_done": self.cfg.use_done, "warnings": self.cfg.warnings,
-            "has_sub": self.cfg.has_sub, "excluded": self.excluded,
+            "has_sub": self.cfg.has_sub, "excluded": self.excluded, "has_ms": self.has_ms,
             "tree": self.tree(),
         }
 
@@ -569,10 +609,11 @@ class Index:
             conds.append("(" + (" OR ".join(parts) or "0") + ")")
         if f.get("t0") is not None:
             conds.append("ts >= ?")
-            args.append(int(f["t0"]))
+            args.append(float(f["t0"]))
         if f.get("t1") is not None:
-            conds.append("ts <= ?")
-            args.append(int(f["t1"]))
+            t1 = float(f["t1"])
+            conds.append("ts <= ?" if t1 != int(t1) else "ts < ?")  # a whole second (To box) includes its milliseconds
+            args.append(t1 if t1 != int(t1) else t1 + 1)
         if f.get("events_only"):
             conds.append("level IS NOT NULL")
         if f.get("alarms_only"):
@@ -602,7 +643,7 @@ class Index:
         hit = self._filter_cache.get(key)
         if hit is None:
             where, args = self._where(f)
-            ids, tss = array.array("q"), array.array("q")
+            ids, tss = array.array("q"), array.array("d")
             for rid, ts in self.db.execute(f"SELECT rowid, ts FROM lines{where} ORDER BY rowid", args):
                 ids.append(rid)
                 tss.append(ts)
@@ -639,14 +680,14 @@ class Index:
     def locate(self, f, ts=None, rid=None):
         """Position of the first filtered line with ts >= the given time (or rowid >= the given id)."""
         ids, tss = self.rows(f)
-        return bisect.bisect_left(ids, int(rid)) if rid is not None else bisect.bisect_left(tss, int(ts))
+        return bisect.bisect_left(ids, int(rid)) if rid is not None else bisect.bisect_left(tss, float(ts))
 
     def events(self, t0, t1, expand=(), limit=EVENT_LIMIT):
         """What the swimlanes need: event points, intervals, log density per module.
         expand: modules expanded in the swimlanes; their density is also counted per (module, sub-module), keyed "module\x01sub" (none is "").
         More than limit events in the range: alarms, clears and abnormal lines are all kept, plain events are thinned out evenly
         over the whole range (every k-th one), so the right side of the swimlanes doesn't go blank; truncated tells the page."""
-        t0, t1 = int(t0), int(t1)
+        t0, t1 = float(t0), float(t1)
         sql = ("SELECT rowid, ts, module, sub, event, level, alarm, alarm_state, color FROM lines "
                "WHERE level IS NOT NULL AND ts BETWEEN ? AND ?")
         n = self.db.execute("SELECT COUNT(*) FROM lines WHERE level IS NOT NULL AND ts BETWEEN ? AND ?", (t0, t1)).fetchone()[0]
@@ -656,17 +697,17 @@ class Index:
         ivs = self.db.execute("SELECT module, sub, name, kind, t0, t1, end_event, closed FROM intervals "
                               "WHERE t1 >= ? AND t0 <= ?", (t0, t1)).fetchall()
         buckets = 200
-        width = max(1, (t1 - t0 + buckets - 1) // buckets)
+        width = max(0.001, (t1 - t0) / buckets)
         counts = defaultdict(lambda: [0] * buckets)
         for mod, b, n in self.db.execute(
-                "SELECT module, (ts - ?) / ?, COUNT(*) FROM lines WHERE ts BETWEEN ? AND ? GROUP BY 1, 2",
+                "SELECT module, CAST((ts - ?) / ? AS INT), COUNT(*) FROM lines WHERE ts BETWEEN ? AND ? GROUP BY 1, 2",
                 (t0, width, t0, t1)):
             if 0 <= b < buckets:
                 counts[mod][b] = n
         expand = [m for m in expand if m in self.modules]
         if expand:
             for mod, sub, b, n in self.db.execute(
-                    "SELECT module, IFNULL(sub, ''), (ts - ?) / ?, COUNT(*) FROM lines "
+                    "SELECT module, IFNULL(sub, ''), CAST((ts - ?) / ? AS INT), COUNT(*) FROM lines "
                     f"WHERE ts BETWEEN ? AND ? AND module IN ({','.join('?' * len(expand))}) GROUP BY 1, 2, 3",
                     (t0, width, t0, t1, *expand)):
                 if 0 <= b < buckets:
