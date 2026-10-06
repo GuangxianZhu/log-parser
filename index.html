@@ -863,11 +863,12 @@ const lanes = {
     const cv = this.cv, c = cv.getContext("2d"), W = cv.clientWidth, H = cv.clientHeight, span = S.view.t1 - S.view.t0;
     c.clearRect(0, 0, W, H);
     // time axis, background of the trace range
-    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
-    const step = steps.find((s) => s >= span / Math.max(1, (W - LEFT) / 110)) || 604800;
+    const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 345600, 604800, 1209600, 2419200];
+    const want = span / Math.max(1, (W - LEFT) / 120);
+    const step = steps.find((s) => s >= want) || Math.ceil(want / 86400) * 86400;  // at least ~120 px between labels (hh:mm:ss with a date fits)
     c.font = FONT; c.strokeStyle = "#eef0f3";
     // ticks fall on whole seconds/minutes/hours/midnight of the selected time zone (offset taken per tick, so a DST change stays aligned).
-    // Label: MM-DD for day steps; else hh:mm (hh:mm:ss under one minute), with the date on the first tick and wherever the day changes
+    // Label: always hh:mm:ss, with the date on the first tick and wherever the day changes (MM-DD only for steps of a day or more)
     let prevDay = null, prevTk = -Infinity;
     for (let tk = Math.ceil((S.view.t0 + tzOffset(S.view.t0)) / step) * step - tzOffset(S.view.t0); tk <= S.view.t1; tk += step) {
       if (step >= 3600) { const o = tzOffset(tk), t = Math.round((tk + o) / step) * step - o; if (t > prevTk) tk = t; }
@@ -875,7 +876,7 @@ const lanes = {
       const x = xOf(cv, tk), p = tzParts(tk), day = `${pad(p.mo)}-${pad(p.d)}`;
       if (x < LEFT) continue;
       c.beginPath(); c.moveTo(x, AXIS_H - 4); c.lineTo(x, H); c.stroke();
-      const hm = `${pad(p.h)}:${pad(p.mi)}` + (step < 60 ? `:${pad(p.s)}` : "");
+      const hm = `${pad(p.h)}:${pad(p.mi)}:${pad(p.s)}`;
       const showDay = step >= 86400 || day !== prevDay;
       c.fillStyle = showDay ? "#374151" : "#6b7280";
       c.fillText(step >= 86400 ? day : showDay ? `${day} ${hm}` : hm, x + 2, 14);
@@ -976,6 +977,13 @@ const lanes = {
       c.strokeStyle = "#2563eb"; c.setLineDash([4, 3]);
       c.beginPath(); c.moveTo(x, AXIS_H - 6); c.lineTo(x, H); c.stroke(); c.setLineDash([]);
     }
+    if (this.hoverX != null && this.hoverX > LEFT && !this.drag) {  // mouse position: guide line + exact time on the axis, at any zoom
+      const t = tOf(cv, this.hoverX), lbl = fmtTs(Math.floor(t)), tw = c.measureText(lbl).width + 8;
+      const lx = Math.min(Math.max(this.hoverX - tw / 2, LEFT), W - tw);
+      c.strokeStyle = "rgba(17,24,39,0.35)"; c.beginPath(); c.moveTo(this.hoverX, AXIS_H); c.lineTo(this.hoverX, H); c.stroke();
+      c.fillStyle = "#111827"; c.fillRect(lx, 1, tw, AXIS_H - 4);
+      c.fillStyle = "#fff"; c.fillText(lbl, lx + 4, 14);
+    }
     if (this.drag && this.drag.brush) {
       c.fillStyle = "rgba(37,99,235,0.15)";
       c.fillRect(Math.min(this.drag.x, this.drag.bx), AXIS_H, Math.abs(this.drag.bx - this.drag.x), H - AXIS_H);
@@ -1006,10 +1014,12 @@ const lanes = {
   const cv = lanes.cv, tipEl = $("tip");
   cv.addEventListener("wheel", (e) => {
     e.preventDefault();
-    const tc = tOf(cv, e.offsetX), k = e.deltaY > 0 ? 1.25 : 0.8;
-    const t0 = tc - (tc - S.view.t0) * k, t1 = tc + (S.view.t1 - tc) * k;
-    if (t1 - t0 < 10) return;
-    S.view = { t0, t1 }; lanes.draw(); viewChanged();
+    const tc = tOf(cv, e.offsetX), span = S.view.t1 - S.view.t0;
+    // zoom in down to 10 s; zoom out at most to the whole log plus half of it again (further out is empty)
+    const maxSpan = S.summary ? Math.max(60, (S.summary.t_max - S.summary.t_min) * 1.5) : 86400;
+    const k = Math.min(Math.max(e.deltaY > 0 ? 1.25 : 0.8, 10 / span), maxSpan / span);
+    if (Math.abs(k - 1) < 1e-6) return;
+    S.view = { t0: tc - (tc - S.view.t0) * k, t1: tc + (S.view.t1 - tc) * k }; lanes.draw(); viewChanged();
   }, { passive: false });
   cv.addEventListener("mousedown", (e) => { lanes.drag = { x: e.offsetX, bx: e.offsetX, v: { ...S.view }, moved: false, brush: e.shiftKey }; });
   window.addEventListener("mousemove", (e) => {
@@ -1041,7 +1051,12 @@ const lanes = {
     S.view = { t0: S.summary.t_min, t1: Math.max(S.summary.t_max, S.summary.t_min + 60) };
     lanes.draw(); viewChanged();
   });
+  cv.addEventListener("mouseleave", () => { lanes.hoverX = null; lanes.draw(); });
   cv.addEventListener("mousemove", (e) => {
+    if (!lanes.drag) {  // redraw at most once per frame for the hover guide
+      lanes.hoverX = e.offsetX;
+      if (!lanes.hoverRaf) lanes.hoverRaf = requestAnimationFrame(() => { lanes.hoverRaf = 0; lanes.draw(); });
+    }
     const hit = lanes.drag ? null : lanes.hit(e.offsetX, e.offsetY);
     if (!hit) { tipEl.classList.add("hidden"); return; }
     tipEl.textContent = lanes.tip(hit); tipEl.classList.remove("hidden");
