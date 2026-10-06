@@ -154,6 +154,8 @@ canvas { display: block; width: 100%; cursor: crosshair; }
   <nav>
     <button class="tab active" data-tab="main">Timeline</button>
     <button class="tab" data-tab="health" title="How many lines each regex hit, and what the lines it missed look like">Regex check</button>
+    <label class="hint" style="align-self:center;margin-left:6px" title="Time zone used to show and type times (the logs store absolute UNIX time). Remembered in this browser">Time zone
+      <select id="tz"></select></label>
     <a href="#" id="resetLayout" class="hint" style="align-self:center;margin-left:6px" title="Reset splitters and column widths to defaults">Reset layout</a>
   </nav>
 </header>
@@ -251,19 +253,52 @@ const S = {
   sel: {},              // module -> Set(selected functions)
   open: new Set(),      // expanded modules
   f: {}, count: 0, pages: new Map(), selId: null,      // list: filter, hit count, fetched pages, selected row
+  tz: "",  // time zone for showing/typing times: "" = browser local, else IANA name (see setTz)
   view: { t0: 0, t1: 1 }, trace: null, cursorTs: null,  // swimlanes: visible time range, trace range, current time of the list
   ev: null, alarms: [],
 };
 
 // ===== Helpers =====
 const pad = (n) => String(n).padStart(2, "0");
+// ----- time zone: all times are shown and typed in S.tz ("" = the browser's local time zone, else an IANA name like "UTC", "Asia/Tokyo")
+const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+const TZ_LIST = ["UTC", "Asia/Shanghai", "Asia/Tokyo", "Asia/Seoul", "Asia/Singapore", "Asia/Kolkata", "Europe/London",
+  "Europe/Berlin", "Europe/Moscow", "America/New_York", "America/Chicago", "America/Los_Angeles", "Australia/Sydney"];
+function makeTzFmt(tz) {  // null if the browser doesn't know the time zone
+  try { return new Intl.DateTimeFormat("en-US", { timeZone: tz || undefined, hourCycle: "h23", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }); } catch { return null; }
+}
+let tzFmt = makeTzFmt("");
+function setTz(tz) {  // returns false if the browser doesn't know the time zone
+  const f = makeTzFmt(tz);
+  if (!f) return false;
+  tzFmt = f; S.tz = tz; return true;
+}
+function tzParts(ts, fmt = tzFmt) {  // UNIX seconds -> wall clock {y, mo (1-12), d, h, mi, s} in S.tz
+  const p = {};
+  for (const x of fmt.formatToParts(new Date(ts * 1000))) p[x.type] = +x.value;
+  return { y: p.year, mo: p.month, d: p.day, h: p.hour % 24, mi: p.minute, s: p.second };
+}
+const tzOffset = (ts, fmt = tzFmt) => {  // seconds east of UTC
+  const p = tzParts(ts, fmt);
+  return Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) / 1000 - Math.floor(ts);
+};
+function tzEpoch(y, mo, d, h, mi, s) {  // wall clock in S.tz (mo 0-11, may overflow like new Date()) -> UNIX seconds
+  const w = Date.UTC(y, mo, d, h, mi, s) / 1000;
+  const t = w - tzOffset(w);
+  return w - tzOffset(t);  // second pass: right across a DST change
+}
+function tzLabel(tz = S.tz) {
+  const t = tz || LOCAL_TZ, off = tzOffset(Date.now() / 1000, makeTzFmt(tz)), a = Math.abs(off) / 60;
+  return `${t} (UTC${off < 0 ? "-" : "+"}${pad(Math.floor(a / 60))}:${pad(a % 60)})`;
+}
 function fmtTs(ts, withDate = true) {
   if (!ts) return "--";
-  const d = new Date(ts * 1000);
-  const hms = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  return withDate ? `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hms}` : hms;
+  const d = tzParts(ts);
+  const hms = `${pad(d.h)}:${pad(d.mi)}:${pad(d.s)}`;
+  return withDate ? `${pad(d.mo)}-${pad(d.d)} ${hms}` : hms;
 }
-const fmtFull = (ts) => `${new Date(ts * 1000).getFullYear()}-${fmtTs(ts)}`;
+const fmtFull = (ts) => `${tzParts(ts).y}-${fmtTs(ts)}`;
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // alarm name (learned from the logs by [parser] alarm_name, e.g. 12345678 -> TMP1) and the description from alarm_table.csv (looked up by code or name)
 const alarmName = (code) => (S.summary && code && S.summary.alarm_names[code]) || "";
@@ -449,10 +484,10 @@ function parseTime(text, base, isEnd) {
   if (/^\d{13}$/.test(t)) return Math.floor(+t / 1000);
   const m = t.match(/^(?:(?:(\d{4})[-\/.])?(\d{1,2})[-\/.](\d{1,2}))?[ T]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
   if (!m || (!m[3] && m[4] == null)) return NaN;
-  const b = new Date(base * 1000);
-  const y = m[1] ? +m[1] : b.getFullYear(), mo = m[2] ? +m[2] - 1 : b.getMonth(), d = m[3] ? +m[3] : b.getDate();
-  if (m[4] == null) return new Date(y, mo, d, isEnd ? 23 : 0, isEnd ? 59 : 0, isEnd ? 59 : 0).getTime() / 1000;  // date only: the whole day
-  return new Date(y, mo, d, +m[4], +m[5], m[6] != null ? +m[6] : isEnd ? 59 : 0).getTime() / 1000;
+  const b = tzParts(base);  // times are typed in the selected time zone
+  const y = m[1] ? +m[1] : b.y, mo = m[2] ? +m[2] - 1 : b.mo - 1, d = m[3] ? +m[3] : b.d;
+  if (m[4] == null) return tzEpoch(y, mo, d, isEnd ? 23 : 0, isEnd ? 59 : 0, isEnd ? 59 : 0);  // date only: the whole day
+  return tzEpoch(y, mo, d, +m[4], +m[5], m[6] != null ? +m[6] : isEnd ? 59 : 0);
 }
 function applyTimeRange() {
   if (!S.summary) return;
@@ -720,7 +755,8 @@ const lanes = {
     const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
     const step = steps.find((s) => s >= span / Math.max(1, (W - LEFT) / 110)) || 604800;
     c.font = FONT; c.fillStyle = "#6b7280"; c.strokeStyle = "#eef0f3";
-    for (let tk = Math.ceil(S.view.t0 / step) * step; tk <= S.view.t1; tk += step) {
+    const off = step >= 3600 ? tzOffset(S.view.t0) : 0;  // hour/day ticks fall on whole hours/midnight of the selected time zone
+    for (let tk = Math.ceil((S.view.t0 + off) / step) * step - off; tk <= S.view.t1; tk += step) {
       const x = xOf(cv, tk);
       c.beginPath(); c.moveTo(x, AXIS_H - 4); c.lineTo(x, H); c.stroke();
       c.fillText(step >= 86400 ? fmtTs(tk).slice(0, 5) : fmtTs(tk, !(step < 3600 * 6 && span < 86400)), x + 2, 14);
@@ -961,7 +997,7 @@ function showTextDlg(title, text, file, hint) {
   $("aiDlg").classList.remove("hidden");
 }
 $("btnAi").onclick = async () => {
-  const text = await (await fetch(apiUrl("ai", { f: S.f, ...(S.trace && S.trace.anchor ? { anchor: S.trace.anchor } : {}) }))).text();
+  const text = await (await fetch(apiUrl("ai", { f: S.f, tzoff: tzOffset((S.trace && S.trace.t0) || S.summary.t_min), tzname: S.tz || LOCAL_TZ, ...(S.trace && S.trace.anchor ? { anchor: S.trace.anchor } : {}) }))).text();
   showTextDlg("Export for AI: fault analysis", text, "ai_analyze.txt", "Copy and paste into the company AI; if too long, download as .txt and upload it.");
 };
 $("aiClose").onclick = () => $("aiDlg").classList.add("hidden");
@@ -988,6 +1024,26 @@ $("btnOpen").onclick = () => openFolder(false);
 $("btnReparse").onclick = () => openFolder(true);
 $("folder").addEventListener("keydown", (e) => { if (e.key === "Enter") openFolder(false); });
 $("folder").value = store("folder") || "";
+// time zone selector: browser local time (default), UTC, common zones, the saved one, and "Other…" to type any IANA name
+function fillTz() {
+  const zs = ["", ...TZ_LIST.filter((z) => z !== LOCAL_TZ)];
+  if (S.tz && !zs.includes(S.tz)) zs.push(S.tz);
+  $("tz").innerHTML = zs.map((z) => `<option value="${esc(z)}">${z ? esc(tzLabel(z)) : "Local: " + esc(tzLabel(""))}</option>`).join("") +
+    `<option value="?">Other…</option>`;
+  $("tz").value = S.tz;
+}
+if (!setTz(store("tz") || "")) setTz("");
+fillTz();
+$("tz").addEventListener("change", () => {
+  let z = $("tz").value;
+  if (z === "?") {
+    z = (prompt("IANA time zone name, e.g. Europe/Paris, Asia/Taipei, Etc/GMT-8", S.tz || LOCAL_TZ) || "").trim();
+    if (z && !setTz(z)) alert("Unknown time zone: " + z);
+  } else setTz(z);
+  if (S.tz === LOCAL_TZ) setTz("");
+  store("tz", S.tz); fillTz();
+  if (S.summary) { setFilterFromUI(); if (S.selId != null) { const r = (rowsEl._rows || []).find((x) => x.id === S.selId); if (r) selectRow(r); } renderAlarms(); }
+});
 lanes.resize();
 pollStatus();
 </script>
